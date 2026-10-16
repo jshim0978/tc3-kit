@@ -68,7 +68,7 @@ fi
 : "${TC3_MIN_PARAMS:=8000000000}"
 : "${TC3_ARTIFACT_DIR:=/models/furiosa-ai/Llama-3.1-8B-Instruct}"
 : "${TC3_HF_REPO_ARTIFACT:=furiosa-ai/Llama-3.1-8B-Instruct}"
-: "${TC3_DEVICES:=npu:0:*}"
+: "${TC3_DEVICES:=npu:0}"
 : "${TC3_VLLM_IMAGE:=vllm/vllm-openai:latest}"
 : "${TC3_SOAK_N:=100}"
 : "${TC3_SOAK_TIMEOUT:=60}"
@@ -116,7 +116,8 @@ cmd_platform() {
     capture 1 hypervisors "DUT1 하이퍼바이저 목록"      -- "openstack hypervisor list" || rc=1
     capture 2 flavor      "가속기 패스스루 flavor"       -- "openstack flavor show '${TC3_FLAVOR:-m1.large.rngd}' -c name -c vcpus -c ram -c disk -c properties" || rc=1
     capture 3 server      "시험용 VM 상태/배치 노드"      -- "openstack server show '${TC3_SERVER:-etri-llm-test}' -c name -c status -c flavor -c image -c addresses -c OS-EXT-SRV-ATTR:hypervisor_hostname" || rc=1
-    if (( rc == 0 )); then record 1 platform PASS "openstack CLI"; else record 1 platform FAIL "openstack CLI 조회 실패"; fi
+    # 조회 실패(권한 부족 등)는 선택 절차이므로 MANUAL(Horizon 캡처로 대체)로 기록 — 종합 판정을 FAIL 로 만들지 않음
+    if (( rc == 0 )); then record 1 platform PASS "openstack CLI"; else record 1 platform MANUAL "openstack CLI 조회 실패 — Horizon 캡처로 대체"; rc=0; fi
   else
     {
       echo "# TC3 step 01~03 — 플랫폼 증빙 (MANUAL)"
@@ -191,6 +192,8 @@ cmd_serve() {
   if (( rc == 0 )); then
     capture 6 serve_log "서버 기동 로그 (마지막 40줄)" -- "tail -n 40 '$TC3_RUN_DIR/server.log'" || true
     be_accel_status 6
+    local sid; sid="$(curl -sS -m 10 "$TC3_API_URL/v1/models" 2>/dev/null | json_get '.data[0].id' 2>/dev/null || true)"
+    [[ "$sid" == "$TC3_MODEL_NAME" ]] || warn "서버 모델 id='$sid' ≠ TC3_MODEL_NAME='$TC3_MODEL_NAME' → 절차 7~10 이 실패합니다 (SDK 버전/--served-model-name 확인)"
     if (( SIM )); then record 6 serve SIMULATED "로컬 서버 준비됨"; else record 6 serve PASS "추론 서버 준비 완료"; fi
   else
     capture 6 serve_log "서버 기동 로그 (실패)" -- "tail -n 80 '$TC3_RUN_DIR/server.log'" || true

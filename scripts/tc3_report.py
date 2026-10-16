@@ -40,9 +40,26 @@ STEP_TITLES = {
 REQUIRED = [4, 5, 6, 7, 8, 9, 10, 11]
 
 
+def step_ok(s):
+    """단계의 최종 결과가 성공(PASS/SIMULATED)일 때만 로그(이어쓰기)에서 수치를 읽는다 — 실패한 마지막 시도 옆에
+    이전 시도의 성공 수치가 찍히지 않도록."""
+    return s in by_step and by_step[s]["result"] in ("PASS", "SIMULATED")
+
+
+_soak_summary = None
+_sj = os.path.join(a.run_dir, "soak_summary.json")
+if os.path.exists(_sj):  # 마지막 soak 시도의 요약 (bin/tc3 soak 가 시도마다 새로 씀)
+    try:
+        _soak_summary = json.load(open(_sj, encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        _soak_summary = None
+
+
 def soak_requests(run_dir):
+    if _soak_summary:
+        return _soak_summary.get("n")
     p = os.path.join(run_dir, "step10_soak.log")
-    if os.path.exists(p):
+    if step_ok(10) and os.path.exists(p):
         m = re.findall(r"requests\s*:\s*(\d+)", open(p, encoding="utf-8").read())
         if m:
             return int(m[-1])
@@ -75,19 +92,18 @@ def verdict(steps):
 
 # 핵심 수치 추출
 total_params = None
-for fn in glob.glob(os.path.join(a.run_dir, "step05_model_params.log")):
+for fn in (glob.glob(os.path.join(a.run_dir, "step05_model_params.log")) if step_ok(5) else []):
     m = re.findall(r"total parameters = ([\d,]+)", open(fn, encoding="utf-8").read())
     if m:
         total_params = int(m[-1].replace(",", ""))
 soak = {}
-_sj = os.path.join(a.run_dir, "soak_summary.json")
-if os.path.exists(_sj):  # 마지막 soak 시도의 요약 (이전 시도 수치가 섞이지 않음)
+if _soak_summary:
     try:
-        _s = json.load(open(_sj, encoding="utf-8"))
+        _s = _soak_summary
         soak = {"success": f"{_s['ok']}/{_s['n']}", "p50": f"{_s['p50']:.3f}", "p95": f"{_s['p95']:.3f}", "max": f"{_s['max']:.3f}"}
     except Exception:  # noqa: BLE001
         soak = {}
-for fn in ([] if soak else glob.glob(os.path.join(a.run_dir, "step10_soak.log"))):
+for fn in ([] if soak or not step_ok(10) else glob.glob(os.path.join(a.run_dir, "step10_soak.log"))):
     t = open(fn, encoding="utf-8").read()
     for key, pat in [("success", r"success\s*:\s*(\S+)"), ("p50", r"latency p50\s*:\s*(\S+)"),
                      ("p95", r"latency p95\s*:\s*(\S+)"), ("max", r"latency max\s*:\s*(\S+)")]:

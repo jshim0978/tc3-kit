@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # TEST STUB — furiosa-llm 흉내 (tests 전용, 시험 당일 사용 안 함)
-#   STUB_SERVE_MODE=ok|die|hang|stubborn   STUB_FORCE_MODEL=<id>   STUB_DELAY=<s>
+#   STUB_SERVE_MODE=ok|die|hang|stubborn|orphan   STUB_FORCE_MODEL=<id>   STUB_DELAY=<s>
 case "${1:-}" in
   --version) echo "furiosa-llm 2026.1.0 (tc3 test stub)"; exit 0 ;;
   serve) shift ;;
@@ -26,4 +26,6 @@ case "${STUB_SERVE_MODE:-ok}" in
 esac
 # 실제 furiosa-llm 처럼 워커(자식) 프로세스가 포트를 잡는다 → 부모만 죽이면 자식이 남는 상황을 재현
 python3 "$(dirname "$(readlink -f "$0")")/../fake_openai.py" --port "$port" --model "${STUB_FORCE_MODEL:-$name}" --startup-delay "${STUB_DELAY:-2}" &
+# orphan: 서버가 준비된 뒤 부모(그룹 리더)만 먼저 종료 → 워커만 남은 상태를 tc3 stop 이 정리하는지 검증
+if [[ "${STUB_SERVE_MODE:-ok}" == orphan ]]; then sleep 4; exit 0; fi
 wait

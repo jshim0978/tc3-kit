@@ -20,9 +20,11 @@ be_install() {
     sudo apt-get update -y && sudo apt-get install -y nvidia-container-toolkit
     sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker
   fi
-  py_deps_install
+  local rc=0
+  py_deps_install || rc=1
   log "vLLM 이미지 pull: $TC3_VLLM_IMAGE"
-  docker pull "$TC3_VLLM_IMAGE"
+  docker pull "$TC3_VLLM_IMAGE" || rc=1
+  return $rc
 }
 
 be_env_check() {

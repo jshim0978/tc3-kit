@@ -34,13 +34,17 @@ _furiosa_ver() {
   local py; read -ra py <<< "$(_furiosa_py)"
   "${py[@]}" -c "from importlib.metadata import version; print(version('furiosa-llm'))" 2>/dev/null
 }
-# _ver_ge A B : A >= B (점 구분 숫자 비교, 2026.2.0rc1 같은 접미사는 무시)
-_ver_ge() { [[ "$(printf '%s\n%s\n' "${2%%[a-z]*}" "${1%%[a-z]*}" | sort -V | head -1)" == "${2%%[a-z]*}" ]]; }
+# _ver_norm V : 숫자 3자리로 정규화 (2026.2 → 2026.2.0, 2026.2.0rc1 → 2026.2.0)
+_ver_norm() { local v="${1%%[!0-9.]*}" p; IFS=. read -ra p <<< "$v"; printf '%d.%d.%d' "${p[0]:-0}" "${p[1]:-0}" "${p[2]:-0}"; }
+# _ver_ge A B : A >= B
+_ver_ge() { local a b; a="$(_ver_norm "$1")"; b="$(_ver_norm "$2")"; [[ "$(printf '%s\n%s\n' "$b" "$a" | sort -V | head -1)" == "$b" ]]; }
+# artifact 출처 기록 파일 — artifact 디렉터리 밖(형제 파일)에 둔다 (SDK 가 디렉터리 안 파일을 해석할 수 있으므로)
+_art_src() { echo "${TC3_ARTIFACT_DIR%/}.tc3_source"; }
 
 be_install() {
   # 이미지(ubuntu-jammy-...-rngd-2026.x)에 드라이버/SDK 가 들어 있으면 설치 단계는 확인만 하고 끝난다.
   log "Furiosa 스택 확인 (드라이버·furiosa-smi·furiosa-llm)"
-  local need_apt=0 need_pip=0 kmods
+  local need_apt=0 need_pip=0 kmods rc=0
   have furiosa-smi || need_apt=1
   kmods="$(lsmod 2>/dev/null)"
   grep -q '^furiosa' <<< "$kmods" || warn "furiosa 커널 모듈이 로드되어 있지 않음 (드라이버 미설치 또는 재부팅 필요)"
@@ -56,22 +60,23 @@ be_install() {
     echo "deb [arch=$(dpkg --print-architecture)] http://asia-northeast3-apt.pkg.dev/projects/furiosa-ai $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
       | sudo tee /etc/apt/sources.list.d/furiosa.list >/dev/null
     sudo apt-get update -y
-    sudo apt-get install -y build-essential "linux-modules-extra-$kv" "linux-headers-$kv"
-    sudo apt-get install -y furiosa-driver-rngd furiosa-smi
+    sudo apt-get install -y build-essential "linux-modules-extra-$kv" "linux-headers-$kv" || rc=1
+    sudo apt-get install -y furiosa-driver-rngd furiosa-smi || rc=1
     warn "드라이버를 새로 설치했으면 재부팅 후 다시 실행하세요: sudo reboot"
   fi
 
   if [[ -n "${TC3_FURIOSA_VENV:-}" && ! -f "$TC3_FURIOSA_VENV/bin/activate" ]]; then
-    python3 -m venv "$TC3_FURIOSA_VENV" && be_activate
+    python3 -m venv "$TC3_FURIOSA_VENV" && be_activate || rc=1
   fi
-  # 증빙 스크립트용 파이썬 패키지 — venv 를 쓰면 venv 에, 아니면 시스템 python3 에
-  py_deps_install
   if (( need_pip )); then
     warn "furiosa-llm 이 없습니다 → pip 로 설치 (드라이버 릴리스와 같은 버전이어야 함: TC3_FURIOSA_LLM_PIN)"
-    python3 -m pip install --upgrade pip
-    python3 -m pip install "furiosa-llm${TC3_FURIOSA_LLM_PIN:+==$TC3_FURIOSA_LLM_PIN}"
+    python3 -m pip install "furiosa-llm${TC3_FURIOSA_LLM_PIN:+==$TC3_FURIOSA_LLM_PIN}" || rc=1
   fi
-  log "furiosa-llm: $(_furiosa_ver || echo '-')  /  $(furiosa-smi info 2>/dev/null | grep -m1 -i rngd | tr -s ' ' || echo 'furiosa-smi: -')"
+  # 증빙 스크립트용 파이썬 패키지 — 없는 것만 설치 (SDK 가 설치된 인터프리터의 기존 패키지는 건드리지 않음)
+  py_deps_install || rc=1
+  local smi; smi="$(furiosa-smi info 2>/dev/null)"
+  log "furiosa-llm: $(_furiosa_ver || echo '-')  /  $(grep -i -m1 rngd <<< "$smi" | tr -s ' ' || echo 'furiosa-smi: -')"
+  return $rc
 }
 
 # 절차 4: VM 에 RNGD 가 할당되었는지 + 실행환경
@@ -98,10 +103,17 @@ be_fetch_model() {
     rev="$(hf_pick_tag "$TC3_HF_REPO_ARTIFACT" "$ver")" || rev=""
     [[ -n "$rev" ]] && log "SDK $ver 에 맞는 artifact 태그: $rev" || warn "SDK '${ver:-?}' 에 맞는 태그를 찾지 못해 main 을 받습니다 — TC3_HF_ARTIFACT_REVISION 으로 지정 권장"
   fi
-  log "RNGD artifact: $TC3_HF_REPO_ARTIFACT${rev:+@$rev} → $TC3_ARTIFACT_DIR (전체 — chat_template·binary_bundle 포함)"
+  local want="${TC3_HF_REPO_ARTIFACT}@${rev:-main}" src; src="$(_art_src)"
+  # 다른 리비전이 이미 받아져 있으면 섞이지 않도록 중단 (이전 리비전의 .fxb 등이 남을 수 있음)
+  if [[ -n "$(ls -A "$TC3_ARTIFACT_DIR" 2>/dev/null)" ]] && { [[ ! -f "$src" ]] || [[ "$(cut -d' ' -f1 "$src")" != "$want" ]]; }; then
+    fail "artifact 디렉터리에 다른 내용이 있음: $TC3_ARTIFACT_DIR (기존: $(cut -d' ' -f1 "$src" 2>/dev/null || echo '출처 불명'), 요청: $want)"
+    fail "  → 디렉터리를 비우거나 TC3_ARTIFACT_DIR 을 새 경로로 지정한 뒤 다시 실행"
+    return 1
+  fi
+  log "RNGD artifact: $want → $TC3_ARTIFACT_DIR (전체 — chat_template·binary_bundle 포함)"
   hf_download "$TC3_HF_REPO_ARTIFACT" "$TC3_ARTIFACT_DIR" "$rev" || return 1
   [[ -n "$(ls -A "$TC3_ARTIFACT_DIR" 2>/dev/null)" ]] || { fail "artifact 디렉터리가 비어 있음: $TC3_ARTIFACT_DIR"; return 1; }
-  echo "${TC3_HF_REPO_ARTIFACT}@${rev:-main} (furiosa-llm ${ver:-?}) $(now_iso)" > "$TC3_ARTIFACT_DIR/.tc3_source"
+  echo "$want (furiosa-llm ${ver:-?}) $(now_iso)" > "$src"
   ok "fetch-model 완료"
 }
 
@@ -109,8 +121,8 @@ be_fetch_model() {
 be_model_extra() {
   local step="$1"
   capture "$step" artifact_ls "RNGD artifact 디렉터리" -- "ls -lh '$TC3_ARTIFACT_DIR'" || return 1
-  if [[ -f "$TC3_ARTIFACT_DIR/.tc3_source" ]]; then
-    capture "$step" artifact_src "artifact 출처(HF 태그)" -- "cat '$TC3_ARTIFACT_DIR/.tc3_source'" || true
+  if [[ -f "$(_art_src)" ]]; then
+    capture "$step" artifact_src "artifact 출처(HF 태그)" -- "cat '$(_art_src)'" || true
   fi
   return 0
 }
@@ -147,18 +159,22 @@ be_preflight() {
   local ln; ln="$(lspci -nn 2>/dev/null | grep -iE 'furiosa|\[1ed2:' | head -1)"
   if [[ -n "$ln" ]]; then pf_ok "RNGD PCI: ${ln:0:100}"; else pf_bad "lspci 에 FuriosaAI(1ed2) 장치 없음 — VM 에 NPU 패스스루 확인"; fi
   if have furiosa-smi && furiosa-smi info >/dev/null 2>&1; then pf_ok "furiosa-smi info 정상"; else pf_bad "furiosa-smi info 실패 (드라이버/권한)"; fi
-  local ver; ver="$(_furiosa_ver)"
+  local ver py; ver="$(_furiosa_ver)"; read -ra py <<< "$(_furiosa_py)"
   if ! have furiosa-llm; then pf_bad "furiosa-llm 없음 (TC3_FURIOSA_VENV=${TC3_FURIOSA_VENV:-미설정})"
   elif [[ -z "$ver" ]]; then pf_warn "furiosa-llm 있음, 버전 확인 불가"
   elif _ver_ge "$ver" 2026.2.0; then pf_ok "furiosa-llm $ver (--served-model-name 지원)"
-  else pf_warn "furiosa-llm $ver < 2026.2.0 — --served-model-name 미지원, /v1/models id 확인 필요"; fi
+  else pf_bad "furiosa-llm $ver < 2026.2.0 — --served-model-name 미지원: /v1/models id 가 '$TC3_MODEL_NAME' 이 아니라 절차 7~10 실패 (SDK 업그레이드 필요)"; fi
+  # SDK 가 실제로 import 되는지 (의존 패키지 충돌로 serve 가 즉시 죽는 경우를 사전에 잡음)
+  if have furiosa-llm; then
+    local ie; if ie="$("${py[@]}" -c 'import furiosa_llm' 2>&1)"; then pf_ok "furiosa_llm import 정상 (${py[*]})"; else pf_bad "furiosa_llm import 실패: ${ie##*$'\n'}"; fi
+  fi
   [[ "${TC3_DEVICES:-}" == *":*" ]] && [[ -n "$ver" ]] && _ver_ge "$ver" 2025.2.0 && pf_warn "TC3_DEVICES=$TC3_DEVICES — 2025.2 이후 문서 표기는 npu:0"
   local kv; kv="$(uname -r)"; if _ver_ge "${kv%%-*}" 6.3; then pf_ok "커널 $kv (≥ 6.3)"; else pf_warn "커널 $kv — RNGD 드라이버 요구 6.3 이상"; fi
   if [[ -z "$(ls -A "$TC3_ARTIFACT_DIR" 2>/dev/null)" ]]; then pf_bad "artifact 없음/비어 있음: $TC3_ARTIFACT_DIR → bin/tc3 fetch-model"
   else
     local fxb; fxb="$(find "$TC3_ARTIFACT_DIR" -maxdepth 2 -name '*.fxb' 2>/dev/null | head -1)"
     if [[ -n "$ver" ]] && _ver_ge "$ver" 2026.4.0 && [[ -z "$fxb" ]]; then pf_bad "SDK $ver 는 FXB 필요 — $TC3_ARTIFACT_DIR 에 .fxb 없음"
-    else pf_ok "artifact: $TC3_ARTIFACT_DIR $( [[ -f "$TC3_ARTIFACT_DIR/.tc3_source" ]] && cut -d' ' -f1 "$TC3_ARTIFACT_DIR/.tc3_source")"; fi
+    else pf_ok "artifact: $TC3_ARTIFACT_DIR $( [[ -f "$(_art_src)" ]] && cut -d' ' -f1 "$(_art_src)")"; fi
   fi
   local busy; busy="$(furiosa-smi ps 2>/dev/null | grep -E '[0-9]+' | grep -viE 'pid|^[+| -]*$' || true)"
   # furiosa-smi ps 출력 형식은 문서에 고정돼 있지 않아 경고로만 표시

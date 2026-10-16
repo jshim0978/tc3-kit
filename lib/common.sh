@@ -194,17 +194,24 @@ print(f"weights complete: {d}")
 PYEOF
 }
 
-# py_deps_install : 증빙 스크립트용 파이썬 패키지 (pip 없으면 설치, PEP 668 환경이면 --break-system-packages)
+# py_deps_install : 증빙 스크립트용 파이썬 패키지 — "없는 것만" 설치한다 (업그레이드 안 함)
+#   furiosa venv 처럼 SDK 가 쓰는 인터프리터에서 numpy/huggingface_hub 를 올리면 SDK 의존성이 깨질 수 있음
 py_deps_install() {
-  local pkgs=(requests safetensors numpy "huggingface_hub[cli]")
+  local mod pkg missing=()
+  for mod in requests:requests safetensors:safetensors numpy:numpy huggingface_hub:huggingface_hub; do
+    pkg="${mod#*:}"; mod="${mod%%:*}"
+    python3 -c "import $mod" 2>/dev/null || missing+=("$pkg")
+  done
+  if (( ${#missing[@]} == 0 )); then ok "파이썬 패키지 이미 설치됨 (requests, safetensors, numpy, huggingface_hub) — 변경 없음"; return 0; fi
   if ! python3 -m pip --version >/dev/null 2>&1; then
     warn "pip 가 없습니다 → python3-pip 설치"
     sudo apt-get update -y && sudo apt-get install -y python3-pip
   fi
-  python3 -m pip install --quiet --upgrade "${pkgs[@]}" 2>/dev/null \
-    || python3 -m pip install --quiet --upgrade --break-system-packages "${pkgs[@]}"
-  if python3 -c 'import requests, safetensors, numpy' 2>/dev/null; then ok "파이썬 패키지 확인 (requests, safetensors, numpy, huggingface_hub)"
-  else fail "파이썬 패키지 설치 실패 — python3 -m pip install requests safetensors numpy"; return 1; fi
+  log "누락된 파이썬 패키지 설치: ${missing[*]}"
+  python3 -m pip install --quiet "${missing[@]}" \
+    || python3 -m pip install --quiet --break-system-packages "${missing[@]}"   # PEP 668 환경(24.04+)
+  if python3 -c 'import requests, safetensors, numpy, huggingface_hub' 2>/dev/null; then ok "파이썬 패키지 확인 (requests, safetensors, numpy, huggingface_hub)"
+  else fail "파이썬 패키지 설치 실패 — python3 -m pip install ${missing[*]}"; return 1; fi
 }
 
 # json_get <jq-filter> : stdin JSON 에서 값 추출 (jq 없으면 python 대체)
@@ -229,10 +236,14 @@ proc_start() { [[ -r "/proc/$1/stat" ]] && sed 's/.*) //' "/proc/$1/stat" | awk 
 save_pid() { echo "$1 $(proc_start "$1")" > "$(pid_file)"; cp "$(pid_file)" "$TC3_RUN_DIR/server.pid" 2>/dev/null || true; }
 server_pid() { local pf; pf="$(pid_file)"; [[ -f "$pf" ]] && awk '{print $1}' "$pf"; }
 server_alive() {
+  # 시작시각이 기록되지 않았으면(기동 직후 종료 등) 우리 프로세스로 보지 않는다
   local pf p st; pf="$(pid_file)"; [[ -f "$pf" ]] || return 1
-  read -r p st < "$pf"; [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null || return 1
-  [[ -z "$st" || "$(proc_start "$p")" == "$st" ]]
+  read -r p st < "$pf"; [[ -n "$p" && -n "$st" ]] && kill -0 "$p" 2>/dev/null || return 1
+  [[ "$(proc_start "$p")" == "$st" ]]
 }
+# 서버 프로세스 그룹(리더 pid = pgid)에 아직 살아 있는 프로세스가 있는지 — 리더가 먼저 죽고 워커만 남은 경우 대비.
+# 그룹이 존재하는 동안 그 번호는 재사용되지 않으므로 리더가 없어도 안전하게 판별된다.
+server_group_alive() { local p; p="$(server_pid)"; [[ -n "$p" ]] && kill -0 -- "-$p" 2>/dev/null; }
 # start_bg <logfile> <cmd...> : 새 프로세스 그룹에서 백그라운드 실행, pid 저장
 start_bg() {
   local logf="$1"; shift
@@ -241,15 +252,21 @@ start_bg() {
   save_pid $!
 }
 kill_pid_file() {
+  local pid target=""; pid="$(server_pid)" || true
   if server_alive; then
-    local pid; pid="$(server_pid)"
     local pgid; pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
-    local target="$pid"
+    target="$pid"
     [[ -n "$pgid" && "$pgid" == "$pid" ]] && target="-$pid"   # 그룹 리더면 그룹 전체(워커 포함)
+  elif server_group_alive; then
+    target="-$pid"                                            # 리더는 죽고 워커만 남은 경우
+  fi
+  if [[ -n "$target" ]]; then
     kill -TERM -- "$target" 2>/dev/null || true
+    # 워커가 NPU 를 반납할 시간을 준다: 그룹 전체가 사라질 때까지(또는 유예 시간까지) 대기 후 KILL
     local t0=$SECONDS
-    while kill -0 "$pid" 2>/dev/null && (( SECONDS - t0 < ${TC3_KILL_GRACE:-20} )); do sleep 0.5; done
+    while kill -0 -- "$target" 2>/dev/null && (( SECONDS - t0 < ${TC3_KILL_GRACE:-20} )); do sleep 0.5; done
     kill -KILL -- "$target" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6; do kill -0 -- "$target" 2>/dev/null || break; sleep 0.5; done
   fi
   rm -f "$(pid_file)"
 }

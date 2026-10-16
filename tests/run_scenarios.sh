@@ -17,6 +17,7 @@ RESULTS=()
 SP="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 mkdir -p "$SP/furiosa_llm-2026.4.0.dist-info"
 printf 'Metadata-Version: 2.1\nName: furiosa-llm\nVersion: 2026.4.0\n' > "$SP/furiosa_llm-2026.4.0.dist-info/METADATA"
+mkdir -p "$SP/furiosa_llm"; echo '__version__ = "2026.4.0"  # tc3 test stub' > "$SP/furiosa_llm/__init__.py"
 git config --global --add safe.directory '*' 2>/dev/null
 NPASS=0; NFAIL=0; NSKIP=0
 
@@ -347,7 +348,55 @@ sc_old_sdk() {
   t serve
   chk "no --served-model-name on SDK < 2026.2" hasnt "$(run_dir)/server.log" "--served-model-name"
   chk "warning shown" has "$SC_LOG" "2026.2.0"
+  chk "serve warns about id mismatch" has "$SC_LOG" "≠ TC3_MODEL_NAME"
   t stop
+  t preflight; chk "preflight FAILS on SDK < 2026.2 (guaranteed 07-10 failure)" is "$(( $? != 0 ))" 1
+}
+
+sc_leader_dies() {
+  fresh leader_dies furiosa; furiosa_env; export STUB_SERVE_MODE=orphan STUB_DELAY=1
+  t serve; chk "serve ok" is $? 0
+  sleep 5   # 리더(스텁 bash)는 종료, 워커(가짜 서버)만 남음
+  chk "worker still alive (setup)" bash -c "pgrep -f '[f]ake_openai.py --port $PORT' >/dev/null"
+  t stop; chk "stop exit 0" is $? 0
+  chk "11 PASS" is "$(st 11)" PASS
+  chk "orphan worker group killed" noproc "[f]ake_openai.py --port $PORT"
+  chk "port closed" closed "$PORT"
+}
+
+sc_ver_compare() {
+  fresh ver_compare furiosa
+  local out
+  out="$( (TC3_HOME="$KIT"; source "$KIT/lib/common.sh"; source "$KIT/lib/backend_furiosa.sh"
+      for c in "2026.2 2026.2.0 0" "2026.1.9 2026.2.0 1" "2026.10.0 2026.2.0 0" "2026.2.0rc1 2026.2.0 0" \
+               "2025.3.1 2025.2.0 0" "2026.4.0.post1 2026.2.0 0" "6.6.87.2 6.3 0" "5.15.0 6.3 1" "2026.2.0 2026.2.0 0"; do
+        set -- $c; _ver_ge "$1" "$2"; r=$?; [[ "$r" == "$3" ]] || echo "BAD: _ver_ge $1 $2 -> $r (want $3)"
+      done) 2>&1)"
+  echo "$out" >> "$SC_LOG"
+  chk "_ver_ge edge cases (2026.2 vs 2026.2.0, 2026.10 vs 2026.2, rc/post suffix, kernel)" is "$out" ""
+}
+
+sc_report_stale_soak() {
+  fresh report_stale_soak mock; export TC3_SOAK_N=3
+  t serve; t soak
+  chk "first soak PASS 3/3 (setup)" is "$(st 10)" PASS
+  TC3_SOAK_N=0 t soak    # 두 번째 시도는 요약 전에 실패 (n<1)
+  chk "10 FAIL after crashed retry" is "$(st 10)" FAIL
+  t stop; t report
+  chk "report shows no numbers from the earlier attempt" hasnt "$(run_dir)/report.md" "success 3/3"
+  chk "D label not from the earlier attempt" hasnt "$(run_dir)/report.md" "연속 3회"
+  chk "retry history listed" has "$(run_dir)/report.md" "재수행 이력"
+}
+
+sc_platform_os_fail() {
+  fresh platform_os_fail mock
+  mkdir -p "$SC_DIR/bin"; printf '#!/bin/sh\necho "Forbidden (HTTP 403)" >&2\nexit 1\n' > "$SC_DIR/bin/openstack"; chmod +x "$SC_DIR/bin/openstack"
+  export PATH="$SC_DIR/bin:$PATH" OS_AUTH_URL=http://keystone.invalid:5000/v3
+  t platform; chk "platform exit 0 when openstack query fails" is $? 0
+  chk "01 MANUAL (Horizon fallback)" is "$(st 1)" MANUAL
+  local rc=0; for c in env model-size serve verify soak stop; do t "$c" || rc=1; done
+  t report; chk "report not FAIL because of optional platform step" is $? 0
+  chk "overall SIMULATED" has "$(run_dir)/summary.json" '"overall": "SIMULATED"'
 }
 
 sc_port_mismatch() {
@@ -367,7 +416,12 @@ sc_fetch_model_net() {
   chk "safetensors downloaded" test -f "$SC_DIR/weights/model.safetensors"
   chk "onnx excluded by patterns" test ! -e "$SC_DIR/weights/onnx"
   chk "artifact full download incl. chat_template.jinja" test -f "$SC_DIR/art/chat_template.jinja"
-  chk "artifact source recorded" test -f "$SC_DIR/art/.tc3_source"
+  chk "artifact source recorded (outside artifact dir)" test -f "$SC_DIR/art.tc3_source"
+  chk "artifact dir has no extra tc3 file" test ! -e "$SC_DIR/art/.tc3_source"
+  export TC3_HF_ARTIFACT_REVISION=v-other
+  t fetch-model; chk "refuses to mix a different revision into the same artifact dir" is "$(( $? != 0 ))" 1
+  chk "explains the mismatch" has "$SC_LOG" "다른 내용이 있음"
+  export TC3_HF_ARTIFACT_REVISION=main
   local tag1 tag2
   tag1="$( (TC3_HOME="$KIT"; source "$KIT/lib/common.sh"; hf_pick_tag furiosa-ai/Llama-3.1-8B-Instruct 2026.3.0) 2>>"$SC_LOG")"
   tag2="$( (TC3_HOME="$KIT"; source "$KIT/lib/common.sh"; hf_pick_tag furiosa-ai/Llama-3.1-8B-Instruct 2025.3.1) 2>>"$SC_LOG")"
@@ -461,7 +515,7 @@ ALL=(mock_all mock_steps furiosa_full serve_dies_fast serve_timeout serve_twice 
      env_quotes_nonl symlink_and_cwd no_jq lang_c rerun_step stale_run report_incomplete stop_nothing cli_misuse platform_manual
      soak_100 lspci_novendor lspci_none vllm_full ctrl_c_serve path_with_spaces nonroot timezone
      proxy_env env_bom soak_live_output backend_switch preflight_ok preflight_bad stop_stubborn old_sdk
-     port_mismatch fetch_model_net)
+     port_mismatch leader_dies ver_compare report_stale_soak platform_os_fail fetch_model_net)
 
 i=0
 for name in "${ALL[@]}"; do

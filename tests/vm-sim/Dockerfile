@@ -21,10 +21,11 @@ RUN chmod +x /usr/local/bin/furiosa-llm /usr/local/bin/furiosa-smi /usr/local/bi
     && SP="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
     && mkdir -p "$SP/furiosa_llm-2026.4.0.dist-info" \
     && printf 'Metadata-Version: 2.1\nName: furiosa-llm\nVersion: 2026.4.0\n' > "$SP/furiosa_llm-2026.4.0.dist-info/METADATA" \
+    && mkdir -p "$SP/furiosa_llm" && echo '__version__ = "2026.4.0"  # vm-sim stub' > "$SP/furiosa_llm/__init__.py" \
     && mkdir -p /models/furiosa-ai/Llama-3.1-8B-Instruct \
     && echo '{"model":"Llama-3.1-8B-Instruct","note":"vm-sim stub artifact"}' > /models/furiosa-ai/Llama-3.1-8B-Instruct/artifact.json \
     && echo stub > /models/furiosa-ai/Llama-3.1-8B-Instruct/model.fxb \
-    && echo "furiosa-ai/Llama-3.1-8B-Instruct@v2026.4 (vm-sim stub)" > /models/furiosa-ai/Llama-3.1-8B-Instruct/.tc3_source \
+    && echo "furiosa-ai/Llama-3.1-8B-Instruct@v2026.4 (vm-sim stub)" > /models/furiosa-ai/Llama-3.1-8B-Instruct.tc3_source \
     && hostname > /dev/null
 EXPOSE 22
 CMD ["bash", "-c", "install -o etri -g etri -m 600 /tmp/authorized_keys /home/etri/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e"]

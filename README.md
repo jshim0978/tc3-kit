@@ -9,6 +9,7 @@ bin/tc3 <command> [--backend furiosa|vllm|llamacpp|mock]
 
   install       패키지/드라이버/이미지 설치·확인 (idempotent)
   fetch-model   모델 가중치·artifact 다운로드
+  preflight     시험 전 점검 (가속기·furiosa-llm·가중치·포트·파이썬 패키지) — 증빙에 기록 안 함
   platform      [1~3] 플랫폼 증빙 (openstack CLI 있으면 자동, 없으면 Horizon 캡처 안내)
   env           [4]   가속기 PCI/드라이버/실행환경 확인
   model-size    [5]   모델 파라미터 수 산출 (safetensors 텐서 합산 = 8,030,261,248)
@@ -65,9 +66,10 @@ TC3_SOAK_N=10 docker compose -f docker/compose.local.yml up --abort-on-container
 ```
 파라미터 수 단계까지 **실측**하려면 원본 safetensors(16 GB, HF gated)를 `models/` 에 받고 `TC3_FIXTURE=0`:
 ```bash
-pip install -U "huggingface_hub[cli]" && huggingface-cli login
-huggingface-cli download meta-llama/Llama-3.1-8B-Instruct --local-dir models/Llama-3.1-8B-Instruct \
-    --include config.json "*.safetensors" model.safetensors.index.json "tokenizer*"
+pip install -U "huggingface_hub[cli]"
+# hf >= 1.0: --include 는 패턴마다 반복 (한 번에 여러 개 쓰면 첫 패턴 외에는 무시됨). unsloth = meta-llama 와 같은 가중치의 비-gated 미러
+hf download unsloth/Meta-Llama-3.1-8B-Instruct --local-dir models/Llama-3.1-8B-Instruct \
+    --include "*.json" --include "*.safetensors"
 TC3_FIXTURE=0 TC3_SOAK_N=10 docker compose -f docker/compose.local.yml up --abort-on-container-exit --exit-code-from tester
 ```
 (Mac 에서 더 빠르게: `brew install llama.cpp` 후 `llama-server -hf bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M --alias Llama-3.1-8B-Instruct --port 8000`
@@ -97,6 +99,7 @@ bin/tc3 install                       # 드라이버·furiosa-smi·furiosa-llm �
 HF_TOKEN=hf_xxx bin/tc3 fetch-model   # 원본 가중치 + RNGD artifact → /models
 
 # 3) 시험 (단계별로 화면 캡처)
+bin/tc3 preflight    # 사전 점검 (✗ 가 있으면 해결 후 진행)
 bin/tc3 env          # [4]
 bin/tc3 model-size   # [5]
 bin/tc3 serve        # [6]
@@ -107,6 +110,12 @@ bin/tc3 report       # report.md
 # 또는 한 번에: bin/tc3 all
 ```
 플랫폼 증빙 [1~3] 은 Horizon(또는 master3 의 openstack CLI)에서 캡처합니다: Hypervisors / Flavor `m1.large.rngd` 의 `pci_passthrough:alias` / Instance `etri-llm-test` 의 Status·Host·IP.
+
+## 검증 · 런북
+- `tests/run_scenarios.sh` — Ubuntu 22.04 컨테이너에서 43개 시나리오(정상·고장 주입·운영 실수) 자동 검증:
+  `docker compose -f docker/compose.local.yml run --rm --no-deps -T --entrypoint bash tester /kit/tests/run_scenarios.sh`
+- `docs/VM_RUNBOOK.md` — 리허설 체크리스트, SDK 버전별 결정표, 원복(wipe), 당일 장애 대응
+- `tc3-capture-vm.ps1` — VM 에서 SSH 로 절차를 실행하며 단계별 터미널 화면 캡처 (`tests/vm-sim` 으로 리허설 가능)
 
 ## 증빙(evidence) 규칙
 - 모든 단계는 `capture` 로 실행되어 **화면에 `$ 명령` → 출력** 순으로 보이고, 같은 내용이 `stepNN_<slug>.log` 에

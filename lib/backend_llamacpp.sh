@@ -8,7 +8,7 @@ be_simulated() { echo 1; }
 be_external_server() { return 0; }   # 서버는 docker compose 의 llm 서비스가 관리 (tc3 가 띄우거나 내리지 않음)
 
 be_install() {
-  py_deps_install
+  py_deps_install || return 1
   log "로컬 시뮬: 추론 서버는 docker compose 의 'llm' 서비스가 담당합니다 (docker/compose.local.yml)"
 }
 

@@ -23,6 +23,9 @@ param(
   [switch]$NoFetch
 )
 $ErrorActionPreference = "Continue"
+# powershell -File 로 실행하면 배열 인자가 "a,b" 한 문자열로 들어오므로 쉼표로 나눈다
+$Steps   = @($Steps   | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+$SshArgs = @($SshArgs | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 # 별도 ssh 설정 파일 (점프 호스트·포트·키를 담은 config) — powershell -File 로도 넘길 수 있는 단일 문자열 인자
 if ($SshConfig) { $SshArgs = @("-F", $SshConfig) + $SshArgs }
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -86,13 +89,14 @@ function Invoke-Vm([string[]]$commands, [string]$cwd = $KitDir, [switch]$Quiet) 
   foreach ($c in $commands) {
     $q = $c.Replace("'", "'\''")
     if (-not $Quiet) { $lines += "printf '%s%s\n' `"`$P`" '$q'" }
-    $lines += "$c; rc=`$?"
+    # 한 단계 안에서 앞 명령이 실패하면 거기서 멈춘다 (실패를 뒤 명령의 성공이 덮지 않도록)
+    $lines += "$c; rc=`$?; if [ `$rc -ne 0 ]; then printf '%s\n' `"`$P`"; exit `$rc; fi"
   }
   if (-not $Quiet) { $lines += 'printf ''%s\n'' "$P"' }
   $lines += 'exit $rc'
   $script = ($lines -join "`n") + "`n"
   $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
-  $remote = "echo $b64 | base64 -d > /tmp/.tc3_capture_step.sh && bash /tmp/.tc3_capture_step.sh; r=`$?; rm -f /tmp/.tc3_capture_step.sh; exit `$r"
+  $remote = "f=`$(mktemp /tmp/tc3_capture.XXXXXX) && echo $b64 | base64 -d > `$f && bash `$f; r=`$?; rm -f `$f; exit `$r"
   # ssh 를 콘솔에 직접 연결해 실행 (출력을 변수로 받으면 화면에 아무것도 안 남음 → 캡처가 빈 창이 됨)
   $argv = @("-t") + $SshArgs + @($Target, $remote) | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
   $p = Start-Process -FilePath "ssh" -ArgumentList ($argv -join ' ') -NoNewWindow -PassThru
@@ -115,27 +119,34 @@ Write-Host "VM 접속 확인: ssh $Target" -ForegroundColor Cyan
 $hn = Get-Vm "hostname"
 if (-not $hn) { Write-Error "ssh $Target 접속 실패 — ~/.ssh/config, 키, 점프 호스트 확인"; exit 1 }
 
+$Results = [ordered]@{}
 if ($Clone) {
   if (-not $RepoUrl) { Write-Error "-Clone 에는 -RepoUrl 이 필요합니다"; exit 1 }
-  Step "TC3_step00a_clone" @("git clone $RepoUrl $KitDir", "cd $KitDir && cp tc3.env.example tc3.env && git log -1 --oneline") "~" | Out-Null
+  $Results["TC3_step00a_clone"] = Step "TC3_step00a_clone" @("git clone $RepoUrl $KitDir", "cd $KitDir && cp tc3.env.example tc3.env && git log -1 --oneline") "~"
+  if ($Results["TC3_step00a_clone"] -ne 0) {
+    Write-Error "git clone 실패 (이미 $KitDir 가 있거나 저장소 접근 불가) — 이전 키트로 진행하지 않도록 중단합니다"; exit 1
+  }
 }
-Step "TC3_step00_vm_and_kit" @("hostname; grep PRETTY_NAME /etc/os-release; uname -r", "git log -1 --oneline", "grep -E '^TC3_(BACKEND|MODEL_NAME|MODEL_DIR|ARTIFACT_DIR|DEVICES|SOAK_N|PORT)=' tc3.env") | Out-Null
-if (-not $NoPreflight) { Step "TC3_step00b_preflight" @("bin/tc3 preflight") | Out-Null }
+$Results["TC3_step00_vm_and_kit"] = Step "TC3_step00_vm_and_kit" @("hostname; grep PRETTY_NAME /etc/os-release; uname -r", "git log -1 --oneline", "grep -E '^TC3_(BACKEND|MODEL_NAME|MODEL_DIR|ARTIFACT_DIR|DEVICES|SOAK_N|PORT)=' tc3.env")
+if (-not $NoPreflight) { $Results["TC3_step00b_preflight"] = Step "TC3_step00b_preflight" @("bin/tc3 preflight") }
 
 # ---------- 1) 절차 4~12 ----------
 $names = @{ "env" = "TC3_step04_env"; "model-size" = "TC3_step05_model_size"; "serve" = "TC3_step06_serve"; "verify" = "TC3_step07-09_verify";
             "soak" = "TC3_step10_soak"; "stop" = "TC3_step11_stop"; "report" = "TC3_step12_report" }
+$serveFailed = $false
 foreach ($s in $Steps) {
   $n = $(if ($names.ContainsKey($s)) { $names[$s] } else { "TC3_step_" + $s })
-  Step $n @("bin/tc3 $s") | Out-Null
+  if ($serveFailed -and $s -in @("verify", "soak")) { Write-Warning "serve 실패 → $s 생략"; $Results[$n] = "skip"; continue }
+  $Results[$n] = Step $n @("bin/tc3 $s")
+  if ($s -eq "serve" -and $Results[$n] -ne 0) { $serveFailed = $true }
 }
 
 # report.md 전체 + 증빙 목록 + status
 $run = Get-Vm "cat $KitDir/evidence/.current_run 2>/dev/null"
 if ($run) {
   $rel = "evidence/" + ($run -split '/')[-1]
-  Step "TC3_step12_report_md" @("cat $rel/report.md") | Out-Null
-  Step "TC3_step12b_evidence" @("ls -l $rel", "bin/tc3 status") | Out-Null
+  $Results["TC3_step12_report_md"] = Step "TC3_step12_report_md" @("cat $rel/report.md")
+  $Results["TC3_step12b_evidence"] = Step "TC3_step12b_evidence" @("ls -l $rel", "bin/tc3 status")
   if (-not $NoFetch) {
     $dst = Join-Path $CapDir "evidence"; New-Item -ItemType Directory -Force -Path $dst | Out-Null
     Write-Host "증빙 가져오기: scp -r ${Target}:$run $dst" -ForegroundColor Cyan
@@ -145,5 +156,12 @@ if ($run) {
 }
 
 Write-Host ""
-Write-Host "완료 — 캡처: $CapDir" -ForegroundColor Green
+$failed = @($Results.Keys | Where-Object { "$($Results[$_])" -ne "0" })
+$Results.GetEnumerator() | ForEach-Object { "{0,-26} {1}" -f $_.Key, $(if ("$($_.Value)" -eq "0") { "ok" } elseif ($_.Value -eq "skip") { "SKIP" } else { "rc=$($_.Value)" }) } | Out-Host
+if ($failed.Count -gt 0) {
+  Write-Host "완료(실패 단계 있음: $($failed -join ', ')) — 캡처: $CapDir" -ForegroundColor Red
+} else {
+  Write-Host "완료 — 모든 단계 정상. 캡처: $CapDir" -ForegroundColor Green
+}
 Get-ChildItem $CapDir -Filter *.png | Select-Object Name, Length | Format-Table -AutoSize
+if ($failed.Count -gt 0) { exit 1 }

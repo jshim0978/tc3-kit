@@ -6,7 +6,7 @@ be_describe()  { echo "LOCAL SIMULATION — built-in mock OpenAI server on port 
 be_simulated() { echo 1; }
 
 be_install() {
-  py_deps_install
+  py_deps_install || return 1
   log "mock 백엔드: 추가 설치 없음"
 }
 
