@@ -412,7 +412,13 @@ sc_fetch_model_net() {
     || { skip "huggingface_hub 설치 불가 (네트워크)"; return; }
   export TC3_HF_REPO_MODEL=hf-internal-testing/tiny-random-LlamaForCausalLM TC3_MODEL_DIR="$SC_DIR/weights"
   export TC3_HF_REPO_ARTIFACT=trl-internal-testing/tiny-LlamaForCausalLM-3.2 TC3_ARTIFACT_DIR="$SC_DIR/art" TC3_HF_ARTIFACT_REVISION=main
+  TC3_FETCH_MIN_FREE_GB=999999 t fetch-model; chk "refuses when disk space is insufficient" is "$(( $? != 0 ))" 1
+  chk "explains disk space" has "$SC_LOG" "디스크 여유"
+  chk "nothing downloaded before the space check" test ! -e "$SC_DIR/weights/config.json"
+  export TC3_FETCH_MIN_FREE_GB=1   # 작은 테스트 저장소라 1 GB 면 충분
   t fetch-model; chk "fetch-model exit 0" is $? 0
+  chk "gated-access check ran" has "$SC_LOG" "HF 접근 가능"
+  chk "prep log saved as evidence" bash -c "ls '$TC3_EVIDENCE_DIR'/*/prep_fetch_model.log >/dev/null"
   chk "config.json downloaded (include-pattern bug guard)" test -f "$SC_DIR/weights/config.json"
   chk "safetensors downloaded" test -f "$SC_DIR/weights/model.safetensors"
   chk "onnx excluded by patterns" test ! -e "$SC_DIR/weights/onnx"
