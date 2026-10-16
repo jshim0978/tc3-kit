@@ -45,24 +45,48 @@ public static class TC3Win {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
 "@
 [TC3Win]::SetProcessDPIAware() | Out-Null
 
+# 캡처 대상 = 스크립트 시작 시점의 전면 창(이 스크립트를 띄운 터미널). 이후 사용자가 다른 창을 앞으로 가져와도
+# 같은 터미널 창을 PrintWindow 로 찍는다 (가려져 있어도 창 내용 그대로, 포커스를 뺏지 않음).
+$script:TermHwnd = [TC3Win]::GetForegroundWindow()
+$cls = New-Object System.Text.StringBuilder 256; [TC3Win]::GetClassName($script:TermHwnd, $cls, 256) | Out-Null
+if ($cls.ToString() -notin @("CASCADIA_HOSTING_WINDOW_CLASS", "ConsoleWindowClass")) {
+  Write-Warning "시작 시 전면 창이 터미널이 아닙니다 (class=$cls) — 단계마다 그 시점의 전면 창을 캡처합니다"
+  $script:TermHwnd = [IntPtr]::Zero
+}
+
 function Snap([string]$name) {
   Start-Sleep -Milliseconds 700
-  $h = [TC3Win]::GetForegroundWindow()
+  $h = $(if ($script:TermHwnd -ne [IntPtr]::Zero) { $script:TermHwnd } else { [TC3Win]::GetForegroundWindow() })
+  if ([TC3Win]::IsIconic($h)) { Write-Warning "터미널 창이 최소화되어 있어 캡처가 비어 보일 수 있습니다" }
+  $wr = New-Object TC3Win+RECT
+  [TC3Win]::GetWindowRect($h, [ref]$wr) | Out-Null
   $r = New-Object TC3Win+RECT
   # DWMWA_EXTENDED_FRAME_BOUNDS(9): Windows 10/11 의 보이지 않는 테두리를 뺀 실제 창 영역 (실패 시 GetWindowRect)
-  if ([TC3Win]::DwmGetWindowAttribute($h, 9, [ref]$r, 16) -ne 0) { [TC3Win]::GetWindowRect($h, [ref]$r) | Out-Null }
+  if ([TC3Win]::DwmGetWindowAttribute($h, 9, [ref]$r, 16) -ne 0) { $r = $wr }
   $w = $r.R - $r.L; $hh = $r.B - $r.T
-  if ($w -le 0 -or $hh -le 0) { Write-Warning "창 크기를 읽지 못해 전체 화면을 캡처합니다"; $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $r.L=$b.Left; $r.T=$b.Top; $w=$b.Width; $hh=$b.Height }
-  $bmp = New-Object System.Drawing.Bitmap $w, $hh
-  $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
+  if ($w -le 0 -or $hh -le 0) { Write-Warning "창 크기를 읽지 못해 전체 화면을 캡처합니다"; $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $r.L=$b.Left; $r.T=$b.Top; $r.R=$b.Right; $r.B=$b.Bottom; $wr=$r; $w=$b.Width; $hh=$b.Height; $h=[IntPtr]::Zero }
   $p = Join-Path $CapDir "$name.png"
-  $bmp.Save($p, [System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $bmp.Dispose()
+  # PrintWindow(PW_RENDERFULLCONTENT=2): 창 전체(테두리 포함)를 그린 뒤 실제 창 영역만 잘라 저장
+  $full = New-Object System.Drawing.Bitmap ($wr.R - $wr.L), ($wr.B - $wr.T)
+  $g = [System.Drawing.Graphics]::FromImage($full); $hdc = $g.GetHdc()
+  $ok = ($h -ne [IntPtr]::Zero) -and [TC3Win]::PrintWindow($h, $hdc, 2)
+  $g.ReleaseHdc($hdc); $g.Dispose()
+  if ($ok) {
+    $bmp = $full.Clone((New-Object System.Drawing.Rectangle ($r.L - $wr.L), ($r.T - $wr.T), $w, $hh), $full.PixelFormat)
+  } else {
+    # 대체: 화면에서 창 영역을 그대로 복사 (가려져 있으면 가린 창이 찍힘)
+    $bmp = New-Object System.Drawing.Bitmap $w, $hh
+    $g2 = [System.Drawing.Graphics]::FromImage($bmp); $g2.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size); $g2.Dispose()
+  }
+  $bmp.Save($p, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose(); $full.Dispose()
   Write-Host "  [capture] $p" -ForegroundColor DarkGray
 }
 
