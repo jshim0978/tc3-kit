@@ -194,6 +194,44 @@ print(f"weights complete: {d}")
 PYEOF
 }
 
+# apt_get <args...> : 새 VM 에서 안전한 apt
+#   - 부팅 직후 unattended-upgrades 가 잡은 잠금을 최대 10분 대기 (Could not get lock 방지)
+#   - 비대화형 + needrestart 자동 (jammy 의 "재시작할 서비스" 대화상자에 멈추지 않도록)
+SUDO=""; (( EUID != 0 )) && SUDO="sudo"   # root(컨테이너 등)면 sudo 없이
+apt_get() { $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=600 -y "$@"; }
+# apt_missing <pkg...> : 설치 안 된 패키지 이름만 출력
+apt_missing() { local p; for p in "$@"; do dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || echo "$p"; done; }
+
+# ensure_dir <dir> : 디렉터리를 만들고 현재 사용자에게 쓰기 권한 (예: /models 는 루트 소유라 sudo 필요)
+ensure_dir() {
+  local d="$1"
+  mkdir -p "$d" 2>/dev/null && [[ -w "$d" ]] && return 0
+  log "sudo 로 디렉터리 생성·소유권 설정: $d"
+  $SUDO mkdir -p "$d" && $SUDO chown "$(id -u):$(id -g)" "$d" && [[ -w "$d" ]]
+}
+
+# hf_access <repo> : 다운로드 권한 확인 (gated 저장소에 토큰/라이선스 동의가 없으면 받기 전에 명확히 실패)
+hf_access() {
+  python3 - "$1" <<'PYEOF'
+import sys
+repo = sys.argv[1]
+try:
+    from huggingface_hub import auth_check
+    from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+except ImportError:
+    sys.exit(0)   # 오래된 huggingface_hub: 확인 생략 (다운로드 단계에서 오류가 나면 그때 표시)
+try:
+    auth_check(repo)
+    print(f"HF 접근 가능: {repo}")
+except GatedRepoError:
+    sys.exit(f"HF 접근 불가(gated): {repo} — 라이선스 동의한 계정의 토큰 필요: `hf auth login` (입력이 화면에 표시되지 않음)")
+except RepositoryNotFoundError:
+    sys.exit(f"HF 저장소 없음 또는 비공개: {repo}")
+except Exception as e:  # noqa: BLE001
+    sys.exit(f"HF 접근 확인 실패 ({type(e).__name__}): {e} — 네트워크/프록시 확인")
+PYEOF
+}
+
 # py_deps_install : 증빙 스크립트용 파이썬 패키지 — "없는 것만" 설치한다 (업그레이드 안 함)
 #   furiosa venv 처럼 SDK 가 쓰는 인터프리터에서 numpy/huggingface_hub 를 올리면 SDK 의존성이 깨질 수 있음
 py_deps_install() {
@@ -205,7 +243,7 @@ py_deps_install() {
   if (( ${#missing[@]} == 0 )); then ok "파이썬 패키지 이미 설치됨 (requests, safetensors, numpy, huggingface_hub) — 변경 없음"; return 0; fi
   if ! python3 -m pip --version >/dev/null 2>&1; then
     warn "pip 가 없습니다 → python3-pip 설치"
-    sudo apt-get update -y && sudo apt-get install -y python3-pip
+    apt_get update && apt_get install python3-pip
   fi
   log "누락된 파이썬 패키지 설치: ${missing[*]}"
   python3 -m pip install --quiet "${missing[@]}" \

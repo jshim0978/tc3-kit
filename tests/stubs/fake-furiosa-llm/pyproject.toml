@@ -1,0 +1,16 @@
+# TEST ONLY — 가짜 furiosa-llm 패키지 (vm-sim 에서 bin/tc3 install 의 venv + uv 설치 경로를 검증하기 위함)
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "furiosa-llm"
+version = "2026.4.0"
+requires-python = ">=3.10"
+description = "tc3 test stub — not the real furiosa-llm"
+
+[project.scripts]
+furiosa-llm = "furiosa_llm.cli:main"
+
+[tool.setuptools]
+packages = ["furiosa_llm"]

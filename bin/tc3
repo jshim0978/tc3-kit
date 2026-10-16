@@ -106,8 +106,17 @@ KO_PROMPT='대한민국의 수도와 그 도시의 대표 명소 두 곳을 세 
 EN_PROMPT='Explain in two sentences what an NPU is and how it differs from a GPU.'
 
 # ---------- 단계 구현 ----------
-cmd_install()     { log "backend: $(be_describe)"; be_install; }
-cmd_fetch_model() { log "backend: $(be_describe)"; be_fetch_model; }
+# 사전 준비(install / fetch-model): 시험 당일 깨끗한 VM 에서 수행 → 전체 출력을 증빙(prep_<이름>.log)에도 남긴다
+_prep() { # _prep <이름> <함수>
+  local name="$1" fn="$2" lg rc
+  lg="$TC3_RUN_DIR/prep_${name}.log"
+  { echo "# TC3 prep — $name"; echo "# time: $(now_iso)  host: $(hostname)  user: $(id -un)  backend: $TC3_BACKEND  kit: $KIT_REV"; echo "# ----"; } >> "$lg"
+  "$fn" 2>&1 | tee -a "$lg"; rc=${PIPESTATUS[0]}
+  { echo "# exit: $rc"; echo; } >> "$lg"
+  return "$rc"
+}
+cmd_install()     { evidence_resume; banner; log "install — $(be_describe)"; _prep install be_install; }
+cmd_fetch_model() { evidence_resume; banner; log "fetch-model — $(be_describe)"; _prep fetch_model be_fetch_model; }
 
 cmd_platform() {
   evidence_resume; banner

@@ -12,14 +12,16 @@
 be_describe()  { echo "Furiosa RNGD + furiosa-llm serve (devices=${TC3_DEVICES:-npu:0})"; }
 be_simulated() { echo 0; }
 
+# furiosa-llm 은 전용 venv 에 설치한다 (공식: uv pip install --torch-backend=auto). 기본 ~/furiosa-venv, "none" 이면 PATH 사용.
+# venv 를 쓰는 이유: pip --user 설치는 ~/.local/bin 이 같은 세션 PATH 에 없어 바로 실행되지 않고, 시스템 패키지와 충돌할 수 있음
+: "${TC3_FURIOSA_VENV:=$HOME/furiosa-venv}"
 be_activate() {
-  if [[ -n "${TC3_FURIOSA_VENV:-}" ]]; then
-    if [[ -f "$TC3_FURIOSA_VENV/bin/activate" ]]; then
-      # shellcheck disable=SC1091
-      source "$TC3_FURIOSA_VENV/bin/activate"
-    else
-      warn "TC3_FURIOSA_VENV=$TC3_FURIOSA_VENV 에 venv 가 없습니다"
-    fi
+  [[ "$TC3_FURIOSA_VENV" == "none" ]] && return 0
+  if [[ -f "$TC3_FURIOSA_VENV/bin/activate" ]]; then
+    # shellcheck disable=SC1091
+    source "$TC3_FURIOSA_VENV/bin/activate"
+  elif ! have furiosa-llm && [[ "${CMD:-}" != "install" ]]; then
+    warn "furiosa-llm 이 설치되어 있지 않습니다 (venv 없음: $TC3_FURIOSA_VENV) → bin/tc3 install"
   fi
 }
 
@@ -41,42 +43,77 @@ _ver_ge() { local a b; a="$(_ver_norm "$1")"; b="$(_ver_norm "$2")"; [[ "$(print
 # artifact 출처 기록 파일 — artifact 디렉터리 밖(형제 파일)에 둔다 (SDK 가 디렉터리 안 파일을 해석할 수 있으므로)
 _art_src() { echo "${TC3_ARTIFACT_DIR%/}.tc3_source"; }
 
+# 깨끗한 VM 에서 시험 당일 수행하는 설치 — 이미 있는 것은 확인만 한다 (몇 번을 실행해도 같은 결과)
+#   [1] 커널 ≥ 6.3  [2] 기본 패키지  [3] Furiosa APT 저장소 + 헤더 + 드라이버·furiosa-smi  [4] NPU 동작 확인
+#   [5] venv + furiosa-llm (공식 방법: uv pip install --torch-backend=auto)  [6] 키트 파이썬 도구
+# 종료코드: 0 완료 / 1 실패 / 3 재부팅 필요 (sudo reboot → 재접속 → bin/tc3 install 다시 실행)
 be_install() {
-  # 이미지(ubuntu-jammy-...-rngd-2026.x)에 드라이버/SDK 가 들어 있으면 설치 단계는 확인만 하고 끝난다.
-  log "Furiosa 스택 확인 (드라이버·furiosa-smi·furiosa-llm)"
-  local need_apt=0 need_pip=0 kmods rc=0
-  have furiosa-smi || need_apt=1
-  kmods="$(lsmod 2>/dev/null)"
-  grep -q '^furiosa' <<< "$kmods" || warn "furiosa 커널 모듈이 로드되어 있지 않음 (드라이버 미설치 또는 재부팅 필요)"
-  have furiosa-llm || need_pip=1
-  local kv; kv="$(uname -r)"
-  _ver_ge "${kv%%-*}" 6.3 || warn "커널 $kv — RNGD 드라이버는 6.3 이상 필요 (jammy: sudo apt install linux-generic-hwe-22.04 후 재부팅)"
+  local rc=0 reboot=0 kv; kv="$(uname -r)"
+  log "[1/6] 커널: $kv"
+  if _ver_ge "${kv%%-*}" 6.3; then ok "커널 $kv (≥ 6.3)"
+  else
+    warn "커널 $kv < 6.3 — RNGD 드라이버 요구사항 → HWE 커널 설치 (설치 후 재부팅 필요)"
+    apt_get update && apt_get install linux-generic-hwe-22.04 || rc=1
+    reboot=1
+  fi
 
-  if (( need_apt )); then
-    warn "furiosa-smi 가 없습니다 → Furiosa APT 저장소(pkg.dev)에서 드라이버·furiosa-smi 설치"
-    sudo apt-get update -y
-    sudo apt-get install -y ca-certificates curl gnupg
-    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor --yes -o /etc/apt/trusted.gpg.d/cloud.google.gpg
+  log "[2/6] 기본 패키지"
+  local miss; mapfile -t miss < <(apt_missing ca-certificates curl gnupg pciutils python3-venv python3-pip)
+  if (( ${#miss[@]} )); then apt_get update && apt_get install "${miss[@]}" || rc=1
+  else ok "기본 패키지 설치됨"; fi
+
+  log "[3/6] Furiosa 드라이버 · furiosa-smi"
+  if [[ ! -f /etc/apt/sources.list.d/furiosa.list ]]; then
+    log "Furiosa APT 저장소 등록 (asia-northeast3-apt.pkg.dev/projects/furiosa-ai)"
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | $SUDO gpg --dearmor --yes -o /etc/apt/trusted.gpg.d/cloud.google.gpg || rc=1
     echo "deb [arch=$(dpkg --print-architecture)] http://asia-northeast3-apt.pkg.dev/projects/furiosa-ai $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
-      | sudo tee /etc/apt/sources.list.d/furiosa.list >/dev/null
-    sudo apt-get update -y
-    sudo apt-get install -y build-essential "linux-modules-extra-$kv" "linux-headers-$kv" || rc=1
-    sudo apt-get install -y furiosa-driver-rngd furiosa-smi || rc=1
-    warn "드라이버를 새로 설치했으면 재부팅 후 다시 실행하세요: sudo reboot"
+      | $SUDO tee /etc/apt/sources.list.d/furiosa.list >/dev/null || rc=1
+    apt_get update || rc=1
+  fi
+  local drv=("furiosa-driver-rngd${TC3_FURIOSA_DRIVER_PIN:+=$TC3_FURIOSA_DRIVER_PIN}" "furiosa-smi${TC3_FURIOSA_SMI_PIN:+=$TC3_FURIOSA_SMI_PIN}")
+  if (( ! reboot )); then
+    # 드라이버(DKMS)는 현재 커널의 헤더가 있어야 빌드된다 → 헤더 먼저
+    mapfile -t miss < <(apt_missing build-essential "linux-modules-extra-$kv" "linux-headers-$kv")
+    (( ${#miss[@]} )) && { apt_get install "${miss[@]}" || rc=1; }
+  fi
+  mapfile -t miss < <(apt_missing furiosa-driver-rngd furiosa-smi)
+  # 고정 버전(PIN)과 설치된 버전이 다르면 고정 버전으로 맞춘다 (리허설에서 검증한 조합만 사용)
+  local dv sv; dv="$(dpkg-query -W -f='${Version}' furiosa-driver-rngd 2>/dev/null)"; sv="$(dpkg-query -W -f='${Version}' furiosa-smi 2>/dev/null)"
+  [[ -n "${TC3_FURIOSA_DRIVER_PIN:-}" && -n "$dv" && "$dv" != "$TC3_FURIOSA_DRIVER_PIN" ]] && miss+=(furiosa-driver-rngd)
+  [[ -n "${TC3_FURIOSA_SMI_PIN:-}" && -n "$sv" && "$sv" != "$TC3_FURIOSA_SMI_PIN" ]] && miss+=(furiosa-smi)
+  if (( ${#miss[@]} )); then apt_get install --allow-downgrades "${drv[@]}" || rc=1
+  else ok "furiosa-driver-rngd $dv · furiosa-smi $sv 설치됨"; fi
+
+  log "[4/6] NPU 동작 확인"
+  if furiosa-smi info 2>/dev/null; then ok "furiosa-smi info 정상"
+  elif ! lspci -nn 2>/dev/null | grep -iE 'furiosa|\[1ed2:' >/dev/null; then
+    fail "PCI 에 FuriosaAI(1ed2) 장치가 없음 — VM 의 NPU 패스스루(flavor/호스트) 확인 필요 (재부팅으로 해결되지 않음)"; rc=1
+  else
+    warn "장치는 보이지만 furiosa-smi info 실패 — 드라이버 모듈 적재를 위해 재부팅 필요"; reboot=1
   fi
 
-  if [[ -n "${TC3_FURIOSA_VENV:-}" && ! -f "$TC3_FURIOSA_VENV/bin/activate" ]]; then
-    python3 -m venv "$TC3_FURIOSA_VENV" && be_activate || rc=1
+  log "[5/6] furiosa-llm (venv: $TC3_FURIOSA_VENV)"
+  if [[ "$TC3_FURIOSA_VENV" != "none" && ! -f "$TC3_FURIOSA_VENV/bin/activate" ]]; then
+    python3 -m venv "$TC3_FURIOSA_VENV" || rc=1
   fi
-  if (( need_pip )); then
-    warn "furiosa-llm 이 없습니다 → pip 로 설치 (드라이버 릴리스와 같은 버전이어야 함: TC3_FURIOSA_LLM_PIN)"
-    python3 -m pip install "furiosa-llm${TC3_FURIOSA_LLM_PIN:+==$TC3_FURIOSA_LLM_PIN}" || rc=1
-  fi
-  # 증빙 스크립트용 파이썬 패키지 — 없는 것만 설치 (SDK 가 설치된 인터프리터의 기존 패키지는 건드리지 않음)
+  be_activate
+  local cur; cur="$(_furiosa_ver)"
+  if [[ -z "$cur" ]] || { [[ -n "${TC3_FURIOSA_LLM_PIN:-}" ]] && [[ "$cur" != "$TC3_FURIOSA_LLM_PIN" ]]; }; then
+    local spec="${TC3_FURIOSA_PIP_SPEC:-furiosa-llm${TC3_FURIOSA_LLM_PIN:+==$TC3_FURIOSA_LLM_PIN}}"
+    log "설치: $spec (uv, torch-backend=auto — GPU 없는 VM 이면 CPU torch 로 받아 CUDA 패키지를 내려받지 않음)"
+    python3 -m pip install --quiet --upgrade pip setuptools wheel uv || rc=1
+    uv pip install --upgrade --torch-backend=auto "$spec" || rc=1
+    hash -r
+  else ok "furiosa-llm $cur 설치됨"; fi
+
+  log "[6/6] 키트 파이썬 도구 (없는 것만 설치 — furiosa-llm 의존성은 건드리지 않음)"
   py_deps_install || rc=1
-  local smi; smi="$(furiosa-smi info 2>/dev/null)"
-  log "furiosa-llm: $(_furiosa_ver || echo '-')  /  $(grep -i -m1 rngd <<< "$smi" | tr -s ' ' || echo 'furiosa-smi: -')"
-  return $rc
+
+  local smiv; smiv="$(dpkg-query -W -f='${Version}' furiosa-smi 2>/dev/null)"
+  log "요약: 커널 $kv / furiosa-driver-rngd $(dpkg-query -W -f='${Version}' furiosa-driver-rngd 2>/dev/null || echo -) / furiosa-smi ${smiv:--} / furiosa-llm $(_furiosa_ver || echo -) / venv $TC3_FURIOSA_VENV"
+  if (( rc != 0 )); then fail "install 실패 — 위 오류를 확인하세요"; return 1; fi
+  if (( reboot )); then warn "재부팅이 필요합니다: sudo reboot → 재접속 후 bin/tc3 install 을 다시 실행 (설치된 항목은 확인만 하고 끝남)"; return 3; fi
+  ok "install 완료"
 }
 
 # 절차 4: VM 에 RNGD 가 할당되었는지 + 실행환경
@@ -93,8 +130,13 @@ be_env_check() {
 
 be_fetch_model() {
   export HF_TOKEN="${HF_TOKEN:-}"
+  ensure_dir "$TC3_MODEL_DIR" && ensure_dir "$TC3_ARTIFACT_DIR" || { fail "모델 디렉터리를 만들 수 없음: $TC3_MODEL_DIR / $TC3_ARTIFACT_DIR"; return 1; }
+  local need="${TC3_FETCH_MIN_FREE_GB:-40}" free
+  free="$(df -Pk "$TC3_MODEL_DIR" | awk 'NR == 2 { print int($4 / 1048576) }')"
+  if (( free < need )); then fail "디스크 여유 ${free} GB < ${need} GB ($TC3_MODEL_DIR) — 가중치(~16 GB)+artifact 저장 공간 부족"; return 1; fi
+  ok "디스크 여유 ${free} GB (필요 ≥ ${need} GB)"
+  hf_access "$TC3_HF_REPO_MODEL" || return 1
   log "원본 가중치(파라미터 수 산출용): $TC3_HF_REPO_MODEL → $TC3_MODEL_DIR"
-  mkdir -p "$TC3_MODEL_DIR" "$TC3_ARTIFACT_DIR"
   hf_download "$TC3_HF_REPO_MODEL" "$TC3_MODEL_DIR" "" "*.json" "*.safetensors" "tokenizer*" || return 1
   check_weights "$TC3_MODEL_DIR" || { fail "가중치 다운로드 불완전 — fetch-model 재실행"; return 1; }
   # artifact 는 설치된 SDK 와 같은 릴리스 태그로 (TC3_HF_ARTIFACT_REVISION 으로 지정 가능)
@@ -153,6 +195,8 @@ be_accel_status() {
 be_serve_stop() {
   kill_pid_file                                   # 프로세스 그룹(워커 포함) 종료
   pkill -f "furiosa-llm serve" 2>/dev/null || true # pid 파일 없이 남은 서버까지 정리
+  # 2026.1~2026.3 은 Ray 를 쓴다 — Ray 데몬은 별도 세션으로 떠 그룹 종료에 안 잡힐 수 있어 우리 사용자 것만 정리
+  if have ray && pgrep -u "$(id -u)" -f 'raylet|gcs_server' >/dev/null 2>&1; then ray stop --force >/dev/null 2>&1 || true; fi
 }
 
 be_preflight() {
@@ -164,6 +208,20 @@ be_preflight() {
   elif [[ -z "$ver" ]]; then pf_warn "furiosa-llm 있음, 버전 확인 불가"
   elif _ver_ge "$ver" 2026.2.0; then pf_ok "furiosa-llm $ver (--served-model-name 지원)"
   else pf_bad "furiosa-llm $ver < 2026.2.0 — --served-model-name 미지원: /v1/models id 가 '$TC3_MODEL_NAME' 이 아니라 절차 7~10 실패 (SDK 업그레이드 필요)"; fi
+  # 고정 버전(PIN)과 실제 설치 버전 일치 — 리허설에서 검증한 조합인지
+  if [[ -n "${TC3_FURIOSA_LLM_PIN:-}" && -n "$ver" ]]; then
+    if [[ "$ver" == "$TC3_FURIOSA_LLM_PIN" ]]; then pf_ok "furiosa-llm = 고정 버전 $TC3_FURIOSA_LLM_PIN"
+    else pf_bad "furiosa-llm $ver ≠ 고정 버전 $TC3_FURIOSA_LLM_PIN → bin/tc3 install"; fi
+  fi
+  local pair p var pin iv
+  for pair in furiosa-driver-rngd:TC3_FURIOSA_DRIVER_PIN furiosa-smi:TC3_FURIOSA_SMI_PIN; do
+    p="${pair%%:*}"; var="${pair#*:}"; pin="${!var:-}"
+    iv="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)"
+    [[ -z "$pin" ]] && continue
+    if [[ -z "$iv" ]]; then pf_warn "$p 패키지 정보 없음 (dpkg) — 고정 버전 $pin 확인 불가"
+    elif [[ "$iv" == "$pin" ]]; then pf_ok "$p = 고정 버전 $pin"
+    else pf_bad "$p $iv ≠ 고정 버전 $pin → bin/tc3 install"; fi
+  done
   # SDK 가 실제로 import 되는지 (의존 패키지 충돌로 serve 가 즉시 죽는 경우를 사전에 잡음)
   if have furiosa-llm; then
     local ie; if ie="$("${py[@]}" -c 'import furiosa_llm' 2>&1)"; then pf_ok "furiosa_llm import 정상 (${py[*]})"; else pf_bad "furiosa_llm import 실패: ${ie##*$'\n'}"; fi

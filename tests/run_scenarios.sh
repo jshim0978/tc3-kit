@@ -35,6 +35,7 @@ fresh() { # fresh <name> <backend>
   export TC3_EVIDENCE_DIR="$SC_DIR/evidence" TC3_BACKEND="$2" TC3_PORT="$PORT" TC3_API_URL="http://127.0.0.1:$PORT"
   export TC3_MODEL_NAME="Llama-3.1-8B-Instruct" TC3_SOAK_N=5 TC3_SOAK_TIMEOUT=10 TC3_READY_TIMEOUT=60
   export TC3_FIXTURE=1 TC3_MOCK_STARTUP_DELAY=1 TC3_MODEL_DIR="$SC_DIR/no-model" TC3_ARTIFACT_DIR="$SC_DIR/artifact"
+  export TC3_FURIOSA_LLM_PIN=2026.4.0   # 테스트용 가짜 furiosa-llm 메타데이터 버전과 일치 (tc3.env.example 의 실제 고정값 대신)
   unset TC3_RUN_DIR
   OK=1
 }

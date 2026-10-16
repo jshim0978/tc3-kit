@@ -5,6 +5,8 @@
 
 .USAGE  (보이는 새 Windows Terminal 창에서 실행 — 캡처 대상은 이 스크립트를 띄운 터미널 창)
   Start-Process wt.exe -ArgumentList '-w new --size 160,60 -d C:\Users\etri-jws\repos\tc3-kit powershell -NoExit -ExecutionPolicy Bypass -File .\tc3-capture-vm.ps1 -Target llmvm'
+  깨끗한 VM 기준 당일 순서: -Clone -RepoUrl <url> -Install -Fetch -AllowReboot
+    (clone → install [재부팅 필요 시 sudo reboot → 재접속 → install 재확인] → fetch-model → preflight → 절차 4~12)
   옵션: -KitDir ~/tc3-kit  -Steps env,model-size,...  -RepoUrl <url> (-Clone 과 함께: 새로 clone 하는 장면부터 캡처)
         -SshConfig <ssh config 파일> (점프 호스트/포트/키)  -SshArgs '-p','2222'  -NoPreflight  -NoFetch
 
@@ -19,6 +21,9 @@ param(
   [string]$SshConfig = "",
   [string]$RepoUrl = "",
   [switch]$Clone,
+  [switch]$Install,
+  [switch]$Fetch,
+  [switch]$AllowReboot,
   [switch]$NoPreflight,
   [switch]$NoFetch
 )
@@ -130,6 +135,41 @@ if ($Clone) {
   }
 }
 $Results["TC3_step00_vm_and_kit"] = Step "TC3_step00_vm_and_kit" @("hostname; grep PRETTY_NAME /etc/os-release; uname -r", "git log -1 --oneline", "grep -E '^TC3_(BACKEND|MODEL_NAME|MODEL_DIR|ARTIFACT_DIR|DEVICES|SOAK_N|PORT)=' tc3.env")
+
+function Show-Summary([int]$code) {
+  Write-Host ""
+  $Results.GetEnumerator() | ForEach-Object { "{0,-26} {1}" -f $_.Key, $(if ("$($_.Value)" -eq "0") { "ok" } elseif ($_.Value -eq "skip") { "SKIP" } else { "rc=$($_.Value)" }) } | Out-Host
+  Write-Host "캡처: $CapDir" -ForegroundColor $(if ($code -eq 0) { "Green" } else { "Red" })
+  exit $code
+}
+# 재부팅 후 SSH 가 다시 될 때까지 대기 (최대 15분)
+function Wait-VmBack {
+  Write-Host "VM 재부팅 대기..." -ForegroundColor Cyan
+  Start-Sleep -Seconds 20
+  $t0 = Get-Date
+  while (((Get-Date) - $t0).TotalMinutes -lt 15) {
+    if (Get-Vm "hostname") { Write-Host "VM 재접속 OK ($([int]((Get-Date) - $t0).TotalSeconds + 20)s)" -ForegroundColor Cyan; return $true }
+    Start-Sleep -Seconds 10
+  }
+  return $false
+}
+
+# ---------- 사전 준비: install (재부팅 포함) · fetch-model — 깨끗한 VM 에서 시작하는 당일 순서 ----------
+if ($Install) {
+  $Results["TC3_step00c_install"] = Step "TC3_step00c_install" @("bin/tc3 install")
+  if ($Results["TC3_step00c_install"] -eq 3) {
+    if (-not $AllowReboot) { Write-Warning "install: 재부팅 필요 — -AllowReboot 가 없어 여기서 멈춥니다"; Show-Summary 1 }
+    $r = Step "TC3_step00c_reboot" @("sudo reboot")
+    $Results["TC3_step00c_reboot"] = $(if ($r -in 0, 255, -1) { 0 } else { $r })   # 접속이 끊기는 것이 정상
+    if (-not (Wait-VmBack)) { Write-Error "재부팅 후 15분 안에 VM 에 다시 접속하지 못함"; Show-Summary 1 }
+    $Results["TC3_step00c_install2"] = Step "TC3_step00c_install2" @("bin/tc3 install")
+  }
+  if ("$($Results[@($Results.Keys)[-1]])" -ne "0") { Write-Error "install 실패 — 이후 단계 중단"; Show-Summary 1 }
+}
+if ($Fetch) {
+  $Results["TC3_step00d_fetch_model"] = Step "TC3_step00d_fetch_model" @("bin/tc3 fetch-model")
+  if ($Results["TC3_step00d_fetch_model"] -ne 0) { Write-Error "fetch-model 실패 — 이후 단계 중단"; Show-Summary 1 }
+}
 if (-not $NoPreflight) { $Results["TC3_step00b_preflight"] = Step "TC3_step00b_preflight" @("bin/tc3 preflight") }
 
 # ---------- 1) 절차 4~12 ----------
