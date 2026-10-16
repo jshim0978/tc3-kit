@@ -13,7 +13,7 @@
 | 0 | `git clone <REPO> && cd tc3-kit && cp tc3.env.example tc3.env` | clone 완료, `git log -1` 커밋 | 10 s |
 | 0c | `bin/tc3 install` | `[1/6]~[6/6]` 후 `PASS install 완료` (종료코드 0) — **종료코드 3 이면 재부팅 필요** | 5–15 min (apt + pip ≈ 수 GB) |
 | 0c' | (3 이면) `sudo reboot` → 재접속 → `bin/tc3 install` | 설치된 항목은 확인만, `PASS install 완료` | 2–5 min |
-| 0e | `bin/tc3 hf-login` | **시험원이 HF 토큰 붙여넣기**(화면에 안 보임) → `PASS HF 접근 확인: <계정> → meta-llama/Llama-3.1-8B-Instruct` | 30 s |
+| 0e | `bin/tc3 hf-login` | **"HF 토큰 입력" 프롬프트가 뜬 뒤** 토큰 붙여넣기 → Enter (화면에 안 보임) → `PASS HF 접근 확인: <계정> → meta-llama/Llama-3.1-8B-Instruct`. ⚠ 프롬프트 전에 미리 붙여넣으면 터미널이 그대로 화면에 표시함 | 30 s |
 | 0d | `bin/tc3 fetch-model` | 디스크 여유 확인 → 원본 가중치 16 GB + artifact → `PASS fetch-model 완료` | 5–40 min (회선 속도) |
 | 0b | `bin/tc3 preflight` | `preflight: 문제 없음` (고정 버전 일치·SDK import·FXB·포트) | 5 s |
 | 4 | `bin/tc3 env` | `PASS [step 04] env` — lspci `1ed2`, furiosa-smi info/status, furiosa-llm 버전 | 5 s |
