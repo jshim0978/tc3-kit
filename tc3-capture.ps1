@@ -149,8 +149,9 @@ do {
 Prompt-Line "docker compose -f docker/compose.local.yml ps; docker compose -f docker/compose.local.yml logs --tail 12 llm"
 & docker @Compose ps
 & docker @Compose logs --tail 12 llm
-Prompt-Line "curl.exe -s http://localhost:8000/v1/models"
-curl.exe -s http://localhost:8000/v1/models | ConvertFrom-Json | ConvertTo-Json -Depth 6
+# .data(OpenAI 호환 목록)만 표시 — 전체 응답은 PS 5.1 ConvertTo-Json 들여쓰기로 80줄이 넘어 ps/로그가 화면 밖으로 밀림
+Prompt-Line "(curl.exe -s http://localhost:8000/v1/models | ConvertFrom-Json).data | ConvertTo-Json -Depth 6"
+(curl.exe -s http://localhost:8000/v1/models | ConvertFrom-Json).data | ConvertTo-Json -Depth 6
 Snap "TC3_step06a_llm_server_ready"
 
 # ---------- 2) 절차 4~12 ----------
