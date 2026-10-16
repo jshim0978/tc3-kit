@@ -131,6 +131,8 @@ if (-not $hn) { Write-Error "ssh $Target 접속 실패 — ~/.ssh/config, 키, �
 $Results = [ordered]@{}
 if ($Clone) {
   if (-not $RepoUrl) { Write-Error "-Clone 에는 -RepoUrl 이 필요합니다"; exit 1 }
+  # 비공개 저장소면 git 이 Username/Password(토큰)를 묻는다 — 사람이 이 창에 입력 (스크립트는 입력하지 않음)
+  if ($RepoUrl -match '^https://') { try { [console]::Beep(880, 250); [console]::Beep(1175, 250) } catch { } }
   $Results["TC3_step00a_clone"] = Step "TC3_step00a_clone" @("git clone $RepoUrl $KitDir", "cd $KitDir && cp tc3.env.example tc3.env && git log -1 --oneline") "~"
   if ($Results["TC3_step00a_clone"] -ne 0) {
     Write-Error "git clone 실패 (이미 $KitDir 가 있거나 저장소 접근 불가) — 이전 키트로 진행하지 않도록 중단합니다"; exit 1

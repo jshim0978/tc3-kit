@@ -93,7 +93,7 @@ Set-ExecutionPolicy -Scope Process Bypass -Force; .\tc3-capture.ps1          # �
 ssh llmvm
 
 # 1) 키트 받기
-git clone https://github.com/<ORG>/tc3-kit.git && cd tc3-kit
+git clone https://github.com/jshim0978/tc3-kit.git && cd tc3-kit   # 비공개 저장소: Username + 읽기 전용 토큰(숨김 입력)
 cp tc3.env.example tc3.env            # TC3_BACKEND=furiosa (기본값)
 
 # 2) 사전 준비 (리허설 때 1회; 당일은 확인만)

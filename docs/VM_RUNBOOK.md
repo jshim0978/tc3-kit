@@ -10,7 +10,7 @@
 
 | # | 명령 | 정상 결과 | 예상 소요 (리허설에서 실측해 채움) |
 |---|---|---|---|
-| 0 | `git clone <REPO> && cd tc3-kit && cp tc3.env.example tc3.env` | clone 완료, `git log -1` 커밋 | 10 s |
+| 0 | `git clone https://github.com/jshim0978/tc3-kit.git && cd tc3-kit && cp tc3.env.example tc3.env` | `Username` → `jshim0978`, `Password` → **읽기 전용 토큰 붙여넣기**(화면에 안 보임) → clone 완료, `git log -1` 커밋 | 30 s |
 | 0c | `bin/tc3 install` | `[1/6]~[6/6]` 후 `PASS install 완료` (종료코드 0) — **종료코드 3 이면 재부팅 필요** | 5–15 min (apt + pip ≈ 수 GB) |
 | 0c' | (3 이면) `sudo reboot` → 재접속 → `bin/tc3 install` | 설치된 항목은 확인만, `PASS install 완료` | 2–5 min |
 | 0e | `bin/tc3 hf-login` | **"HF 토큰 입력" 프롬프트가 뜬 뒤** 토큰 붙여넣기 → Enter (화면에 안 보임) → `PASS HF 접근 확인: <계정> → meta-llama/Llama-3.1-8B-Instruct`. ⚠ 프롬프트 전에 미리 붙여넣으면 터미널이 그대로 화면에 표시함 | 30 s |
@@ -29,11 +29,20 @@
 - 각 단계 첫 줄 `[tc3] run: evidence/<YYYYMMDD-HHMMSS>-furiosa backend: furiosa kit: <commit>` 으로 캡처와 증빙이 1:1 연결.
 - 실패 시 종료코드 ≠ 0 과 `[tc3] FAIL ...` 한 줄 원인. 같은 단계를 다시 하면 같은 run 에 기록되고 report "재수행 이력"에 남는다.
 - 절차 1~3(플랫폼)은 Horizon 캡처.
-- 이 PC 에서 같은 순서로 실행·캡처: `tc3-capture-vm.ps1 -Target llmvm -Clone -RepoUrl <REPO> -Install -HfLogin -Fetch -AllowReboot`
+- 이 PC 에서 같은 순서로 실행·캡처: `tc3-capture-vm.ps1 -Target llmvm -Clone -RepoUrl https://github.com/jshim0978/tc3-kit.git -Install -HfLogin -Fetch -AllowReboot`
+  (clone 단계에서 GitHub 계정·토큰, hf-login 단계에서 HF 토큰을 사람이 그 창에 입력)
   (hf-login 단계에서 알림음 → 사람이 그 창에 토큰을 붙여넣고 Enter. 자동화는 토큰을 입력하지 않는다)
 - 원본 가중치는 공식 `meta-llama/Llama-3.1-8B-Instruct` (gated) — 라이선스 동의한 HF 계정 토큰으로 `bin/tc3 hf-login` (2026-10-16 결정).
   `hf auth login` 대신 쓰는 이유: hub 1.x 의 `hf auth login` 은 브라우저 로그인 메뉴(화살표 선택)가 먼저 떠 원격 터미널에서 실수 여지가 있음.
   `hf-login` 은 숨김 입력으로 받은 토큰을 `huggingface_hub.login()` 에 stdin 으로 넘겨 같은 위치(`~/.cache/huggingface/token`)에 저장한다.
+
+### 키트 저장소 (비공개 — 2026-10-16 결정)
+
+- `https://github.com/jshim0978/tc3-kit` (private, 기본 브랜치 `master`). VM 은 HTTPS 로 clone 하며 git 이 계정·암호를 묻는다.
+- **암호 자리에는 GitHub 토큰**: fine-grained PAT, 저장소 `jshim0978/tc3-kit` 만, 권한 `Contents: Read-only`, 만료는 시험 후(예: 11/10).
+  리허설·시험 당일 모두 사람이 붙여넣는다 (자동화가 입력하지 않음). 깨끗한 VM 에는 credential helper 가 없어 토큰이 디스크에 저장되지 않는다.
+- 시험 당일 VM 이 github.com 에 접속 가능해야 한다 (리허설 3-4 네트워크 확인).
+- 키트 수정은 이 PC 에서 커밋 → `git push` → VM 은 clone 시점의 `master` 를 받는다. **11/3 전에 최종 커밋을 확정**하고 그 해시를 런북에 기록.
 
 ## 2. 버전 고정 (당일 install 이 설치하는 조합 — `tc3.env.example`)
 
@@ -62,7 +71,7 @@
 5. **HF 원본 가중치 접근** (결정: 공식 meta-llama): 사용자가 Llama 3.1 라이선스 동의한 HF 계정을 제공 → install 후 `bin/tc3 hf-login` 에서 사용자가 토큰 입력.
    원복 때 `~/.cache/huggingface`(토큰 포함)가 지워지므로 시험 당일 다시 `hf-login` 한다.
 6. **당일과 같은 전체 흐름 + 캡처** (이 PC, 보이는 창 — hf-login 단계에서 사용자가 토큰 입력):
-   `Start-Process wt.exe -ArgumentList '-w new --size 160,60 -d C:\Users\etri-jws\repos\tc3-kit powershell -NoExit -ExecutionPolicy Bypass -File .\tc3-capture-vm.ps1 -Target llmvm -Clone -RepoUrl <REPO> -Install -HfLogin -Fetch -AllowReboot'`
+   `Start-Process wt.exe -ArgumentList '-w new --size 160,60 -d C:\Users\etri-jws\repos\tc3-kit powershell -NoExit -ExecutionPolicy Bypass -File .\tc3-capture-vm.ps1 -Target llmvm -Clone -RepoUrl https://github.com/jshim0978/tc3-kit.git -Install -HfLogin -Fetch -AllowReboot'`
    → install/fetch-model **소요 시간 실측**해서 1절 표에 기록.
 7. **실기기 확인 항목**: serve 두 번, serve 중 stop, stop 후 `furiosa-smi ps` 빈 것, soak 100회 시간, 서버 기동 시간(`TC3_READY_TIMEOUT` 여유),
    `furiosa-smi ps` 출력 형식, Ray 데몬 잔존 여부(조합 A).
