@@ -1,0 +1,6 @@
+models/
+evidence/
+captures/
+*.zip
+.git/
+.omc/

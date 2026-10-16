@@ -6,8 +6,7 @@ be_describe()  { echo "LOCAL SIMULATION — built-in mock OpenAI server on port 
 be_simulated() { echo 1; }
 
 be_install() {
-  python3 -m pip install --quiet requests safetensors numpy 2>/dev/null \
-    || python3 -m pip install --quiet --break-system-packages requests safetensors numpy
+  py_deps_install
   log "mock 백엔드: 추가 설치 없음"
 }
 
@@ -23,10 +22,9 @@ be_model_extra() { return 0; }
 be_serve_start() {
   local logf="$TC3_RUN_DIR/server.log"
   local cmd=(python3 "$TC3_HOME/scripts/mock_openai_server.py" --port "$TC3_PORT" --model "$TC3_MODEL_NAME" --startup-delay "${TC3_MOCK_STARTUP_DELAY:-4}")
-  echo "# cmd: ${cmd[*]}" > "$logf"
-  nohup "${cmd[@]}" >> "$logf" 2>&1 &
-  save_pid $!
-  log "mock 서버 시작 (pid $(cat "$(pid_file)"), log: $logf)"
+  { echo "# ==== serve $(now_iso)"; echo "# cmd: ${cmd[*]}"; } >> "$logf"
+  start_bg "$logf" "${cmd[@]}"
+  log "mock 서버 시작 (pid $(server_pid), log: $logf)"
 }
 
 be_accel_status() {

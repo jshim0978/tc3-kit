@@ -6,6 +6,7 @@
 # 명령 (절차서 단계 번호와 대응):
 #   install       패키지/드라이버/이미지 설치·확인 (idempotent)
 #   fetch-model   모델 가중치·artifact 다운로드 (HF_TOKEN 필요할 수 있음)
+#   preflight     시험 전 점검 (가속기·서버 실행파일·가중치·포트·파이썬 패키지) — 증빙에 기록하지 않음
 #   platform      [1~3] 플랫폼 증빙: openstack CLI 가 있으면 hypervisor/flavor/server 조회, 없으면 MANUAL
 #   env           [4]   가속기 PCI/드라이버/실행환경 확인
 #   model-size    [5]   모델 파라미터 수 산출 (safetensors)
@@ -18,12 +19,13 @@
 #   status        현재 run 의 단계별 결과
 set -uo pipefail
 
-TC3_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TC3_HOME="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"   # 심볼릭 링크로 실행해도 키트 위치를 찾음
 export TC3_HOME
 # shellcheck source=../lib/common.sh
 source "$TC3_HOME/lib/common.sh"
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# 맨 위 주석 블록(2번째 줄부터 첫 비주석 줄 전까지)을 도움말로 출력
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$TC3_HOME/bin/tc3"; exit "${1:-0}"; }
 
 # ---------- 인자 ----------
 CMD="${1:-}"; [[ -z "$CMD" || "$CMD" == "-h" || "$CMD" == "--help" ]] && usage 0
@@ -31,6 +33,7 @@ shift
 ENV_FILE="$TC3_HOME/tc3.env"
 while (( $# )); do
   case "$1" in
+    --backend|--env|--run) [[ $# -ge 2 && -n "$2" ]] || die "$1 다음에 값이 필요합니다" ;;&
     --backend) TC3_BACKEND="$2"; shift 2 ;;
     --env)     ENV_FILE="$2"; shift 2 ;;
     --run)     TC3_RUN_DIR="$2"; shift 2 ;;
@@ -41,9 +44,18 @@ done
 
 # ---------- 설정 로드 (파일 < 환경변수 우선) ----------
 if [[ -f "$ENV_FILE" ]]; then
-  while IFS='=' read -r k v; do
-    [[ -z "$k" || "$k" =~ ^[[:space:]]*# ]] && continue
-    k="${k//[[:space:]]/}"; v="${v%%#*}"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  # Windows 에서 편집한 파일(CRLF·BOM)·마지막 줄 개행 없음·따옴표 값도 안전하게 읽는다
+  first=1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    (( first )) && { line="${line#$'\xef\xbb\xbf'}"; first=0; }
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) || "$line" != *=* ]] && continue
+    k="${line%%=*}"; v="${line#*=}"
+    k="${k//[[:space:]]/}"
+    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { warn "$(basename "$ENV_FILE"): 무시한 줄: $line"; continue; }
+    v="${v%%#*}"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    if [[ "$v" =~ ^\"(.*)\"$ || "$v" =~ ^\'(.*)\'$ ]]; then v="${BASH_REMATCH[1]}"; fi
+    [[ "$v" == "~" || "$v" == "~/"* ]] && v="$HOME${v#\~}"
     [[ -z "${!k:-}" ]] && export "$k=$v"
   done < "$ENV_FILE"
 fi
@@ -62,13 +74,32 @@ fi
 : "${TC3_SOAK_TIMEOUT:=60}"
 : "${TC3_READY_TIMEOUT:=900}"
 : "${TC3_FIXTURE:=0}"
+TC3_API_URL="${TC3_API_URL%/}"
 export TC3_BACKEND TC3_PORT TC3_API_URL TC3_MODEL_NAME TC3_MODEL_DIR TC3_MIN_PARAMS TC3_ARTIFACT_DIR TC3_DEVICES TC3_VLLM_IMAGE TC3_SOAK_N TC3_SOAK_TIMEOUT TC3_READY_TIMEOUT TC3_FIXTURE
+# 로컬 API 호출이 프록시로 새지 않도록 (VM 에 http_proxy 가 설정된 경우 대비)
+export no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}" NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
+# 파이썬 출력이 tee 파이프에서 버퍼링되지 않게 (soak 진행이 화면에 실시간으로 보이도록)
+export PYTHONUNBUFFERED=1
+# 증빙 시각을 KST 로 (VM 기본 TZ 가 UTC 여도 화면 캡처 시각과 일치)
+export TZ="${TC3_TZ:-${TZ:-Asia/Seoul}}"
+# 서버 포트와 API 주소가 어긋나면 경고 (serve 는 TC3_PORT 로 띄우고 verify/soak 은 TC3_API_URL 로 호출)
+if [[ "$TC3_API_URL" =~ ^https?://(127\.0\.0\.1|localhost):([0-9]+)$ && "${BASH_REMATCH[2]}" != "$TC3_PORT" ]]; then
+  warn "TC3_API_URL($TC3_API_URL) 의 포트가 TC3_PORT($TC3_PORT) 와 다릅니다 — tc3.env 확인"
+fi
 
 BE="$TC3_HOME/lib/backend_${TC3_BACKEND}.sh"
 [[ -f "$BE" ]] || die "지원하지 않는 백엔드: $TC3_BACKEND (furiosa|vllm|llamacpp|mock)"
+# 기본값: tc3 가 서버 프로세스를 직접 띄우고 내린다 (llamacpp 백엔드만 외부 서버 → 덮어씀)
+be_external_server() { return 1; }
+be_activate() { :; }
 # shellcheck disable=SC1090
 source "$BE"
+be_activate   # 예: furiosa venv — 모든 단계가 같은 python/furiosa-llm 을 쓰도록 한 번만 활성화
 SIM="$(be_simulated)"
+KIT_REV="$(git -C "$TC3_HOME" rev-parse --short HEAD 2>/dev/null || echo '-')"
+
+# 단계 시작 시 한 줄: 어느 증빙 run 에 기록되는지 화면(캡처)에 남긴다
+banner() { log "run: evidence/$(basename "$TC3_RUN_DIR")  backend: $TC3_BACKEND  kit: $KIT_REV"; }
 
 PY="$TC3_HOME/scripts"
 KO_PROMPT='대한민국의 수도와 그 도시의 대표 명소 두 곳을 세 문장으로 소개해 주세요.'
@@ -79,13 +110,13 @@ cmd_install()     { log "backend: $(be_describe)"; be_install; }
 cmd_fetch_model() { log "backend: $(be_describe)"; be_fetch_model; }
 
 cmd_platform() {
-  evidence_resume
+  evidence_resume; banner
+  local rc=0
   if have openstack && [[ -n "${OS_AUTH_URL:-}" ]]; then
-    local rc=0
     capture 1 hypervisors "DUT1 하이퍼바이저 목록"      -- "openstack hypervisor list" || rc=1
     capture 2 flavor      "가속기 패스스루 flavor"       -- "openstack flavor show '${TC3_FLAVOR:-m1.large.rngd}' -c name -c vcpus -c ram -c disk -c properties" || rc=1
     capture 3 server      "시험용 VM 상태/배치 노드"      -- "openstack server show '${TC3_SERVER:-etri-llm-test}' -c name -c status -c flavor -c image -c addresses -c OS-EXT-SRV-ATTR:hypervisor_hostname" || rc=1
-    (( rc == 0 )) && record 1 platform PASS "openstack CLI" || record 1 platform FAIL "openstack CLI 조회 실패"
+    if (( rc == 0 )); then record 1 platform PASS "openstack CLI"; else record 1 platform FAIL "openstack CLI 조회 실패"; fi
   else
     {
       echo "# TC3 step 01~03 — 플랫폼 증빙 (MANUAL)"
@@ -97,19 +128,20 @@ cmd_platform() {
     } > "$TC3_RUN_DIR/step01-03_platform_MANUAL.txt"
     record 1 platform MANUAL "Horizon 캡처로 대체 (step01-03_platform_MANUAL.txt 참고)"
   fi
+  return $rc
 }
 
 cmd_env() {
-  evidence_resume
+  evidence_resume; banner
   if be_env_check 4; then
-    (( SIM )) && record 4 env SIMULATED "로컬 환경 — 가속기 없음" || record 4 env PASS "가속기 인식·실행환경 확인"
+    if (( SIM )); then record 4 env SIMULATED "로컬 환경 — 가속기 없음"; else record 4 env PASS "가속기 인식·실행환경 확인"; fi
   else
     record 4 env FAIL "가속기/드라이버 확인 실패"; return 1
   fi
 }
 
 cmd_model_size() {
-  evidence_resume
+  evidence_resume; banner
   local dir="$TC3_MODEL_DIR" min="$TC3_MIN_PARAMS" simnote=""
   if [[ ! -d "$dir" || -z "$(ls "$dir"/*.safetensors 2>/dev/null)" ]]; then
     if [[ "$TC3_FIXTURE" == "1" ]]; then
@@ -120,31 +152,54 @@ cmd_model_size() {
       record 5 model_size FAIL "가중치 없음: $dir (fetch-model 먼저 실행하거나 TC3_FIXTURE=1)"; return 1
     fi
   fi
-  local rc=0
+  local rc=0 out="$TC3_RUN_DIR/.model_params.out"
   capture 5 model_ls    "모델 가중치 디렉터리"        -- "ls -lh '$dir'" || rc=1
-  capture 5 model_params "파라미터 수 산출(safetensors)" -- "python3 '$PY/tc3_count_params.py' '$dir'" || rc=1
+  # 이번 시도의 출력만 따로 받아 수치를 읽는다 (재수행 시 로그에 남은 이전 수치를 읽지 않도록)
+  capture 5 model_params "파라미터 수 산출(safetensors)" -- "python3 '$PY/tc3_count_params.py' '$dir' | tee '$out'" || rc=1
   be_model_extra 5 || true
   local total
-  total="$(grep -h 'total parameters' "$TC3_RUN_DIR"/step05_model_params.log | tail -1 | sed -E 's/.*= *([0-9,]+).*/\1/' | tr -d ',')"
-  if (( rc == 0 )) && [[ -n "$total" ]] && (( total >= min )); then
+  total="$(grep -h 'total parameters' "$out" 2>/dev/null | tail -1 | sed -E 's/.*= *([0-9,]+).*/\1/' | tr -d ',')"
+  rm -f "$out"
+  if (( rc == 0 )) && [[ "$total" =~ ^[0-9]+$ ]] && (( total >= min )); then
     if [[ -n "$simnote" ]]; then record 5 model_size SIMULATED "$simnote: $total params"
     else record 5 model_size PASS "total parameters = $total (≥ $min)"; fi
   else
-    record 5 model_size FAIL "total=$total, 기준=$min"; return 1
+    record 5 model_size FAIL "total=${total:-?}, 기준=$min"; return 1
   fi
 }
 
 cmd_serve() {
-  evidence_resume
+  evidence_resume; banner
+  local pid="" rc=0
+  if ! be_external_server; then
+    # 이전에 tc3 가 띄운 서버가 살아 있으면(serve 재실행·중단 후 재시도) 정지하고 다시 띄운다
+    if server_alive; then
+      warn "이전에 기동한 서버(pid $(server_pid))가 실행 중 → 정지 후 다시 기동합니다"
+      be_serve_stop
+      wait_down "$TC3_API_URL/v1/models" "${TC3_STOP_TIMEOUT:-60}" || true
+    fi
+    # 다른 프로세스가 포트를 잡고 있으면 기동해도 실패하므로 바로 FAIL (대기 시간 낭비 방지)
+    if port_in_use "$TC3_PORT"; then
+      capture 6 serve_port "포트 ${TC3_PORT} 사용 프로세스" -- "$(port_owner_cmd "$TC3_PORT")" || true
+      record 6 serve FAIL "포트 ${TC3_PORT} 이 다른 프로세스에 사용 중 — 해당 프로세스 정리 후 재실행"; return 1
+    fi
+  fi
   be_serve_start
+  be_external_server || pid="$(server_pid)"
   log "준비 대기: $TC3_API_URL/v1/models (최대 ${TC3_READY_TIMEOUT}s)"
-  if wait_http "$TC3_API_URL/v1/models" "$TC3_READY_TIMEOUT"; then
+  wait_http "$TC3_API_URL/v1/models" "$TC3_READY_TIMEOUT" "$pid"; rc=$?
+  if (( rc == 0 )); then
     capture 6 serve_log "서버 기동 로그 (마지막 40줄)" -- "tail -n 40 '$TC3_RUN_DIR/server.log'" || true
     be_accel_status 6
-    (( SIM )) && record 6 serve SIMULATED "로컬 서버 준비됨" || record 6 serve PASS "추론 서버 준비 완료"
+    if (( SIM )); then record 6 serve SIMULATED "로컬 서버 준비됨"; else record 6 serve PASS "추론 서버 준비 완료"; fi
   else
     capture 6 serve_log "서버 기동 로그 (실패)" -- "tail -n 80 '$TC3_RUN_DIR/server.log'" || true
-    record 6 serve FAIL "준비 시간 초과 (${TC3_READY_TIMEOUT}s)"; return 1
+    if (( rc == 2 )); then
+      record 6 serve FAIL "서버 프로세스가 준비 전에 종료됨 — server.log 확인"
+    else
+      record 6 serve FAIL "준비 시간 초과 (${TC3_READY_TIMEOUT}s) — server.log 확인, 정리: bin/tc3 stop"
+    fi
+    return 1
   fi
 }
 
@@ -154,29 +209,41 @@ _write_req() { # _write_req <file> <prompt>
 _check_chat() { # _check_chat <response.json> → 0 if ok (요약 한 줄 출력)
   python3 - "$1" <<'PYEOF'
 import json, sys
-d = json.load(open(sys.argv[1], encoding="utf-8"))
-c = d["choices"][0]["message"]["content"].strip()
-fr = d["choices"][0].get("finish_reason")
-assert len(c) > 0, "empty content"
-u = d.get("usage", {}) or {}
-print(f"content_len={len(c)} finish_reason={fr} completion_tokens={u.get('completion_tokens')}")
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    ch = (d.get("choices") or [{}])[0]
+    c = ((ch.get("message") or {}).get("content") or "").strip()
+except Exception as e:  # noqa: BLE001
+    sys.exit(f"응답 파싱 실패: {type(e).__name__}: {e}")
+if not c:
+    sys.exit("빈 응답(content 없음)")
+u = d.get("usage") or {}
+print(f"content_len={len(c)} finish_reason={ch.get('finish_reason')} completion_tokens={u.get('completion_tokens')}")
 PYEOF
 }
 _chat_step() { # _chat_step <step#> <slug> <title> <prompt>
   local step="$1" slug="$2" title="$3" prompt="$4"
-  local req="$TC3_RUN_DIR/step$(printf '%02d' "$step")_request.json" resp="$TC3_RUN_DIR/step$(printf '%02d' "$step")_response.json"
+  local p; p="$TC3_RUN_DIR/step$(printf '%02d' "$step")"
+  local req="${p}_request.json" resp="${p}_response.json" lg="${p}_${slug}.log"
   _write_req "$req" "$prompt"
-  capture "$step" "$slug" "$title" -- "cat '$req'; echo; curl -sS -m 180 '$TC3_API_URL/v1/chat/completions' -H 'Content-Type: application/json' -d @'$req' | tee '$resp' | python3 -m json.tool --no-ensure-ascii" || return 1
+  rm -f "$resp"
+  if ! capture "$step" "$slug" "$title" -- "cat '$req'; echo; curl -sS -m 180 '$TC3_API_URL/v1/chat/completions' -H 'Content-Type: application/json' -d @'$req' | tee '$resp' | python3 -m json.tool --no-ensure-ascii"; then
+    # 연결 실패·JSON 아님 등: 결과를 반드시 status 에 남긴다 (누락되면 report 판정이 왜곡됨)
+    local head; head="$(head -c 120 "$resp" 2>/dev/null | tr -d '\r\n')"
+    record "$step" "$slug" FAIL "요청/응답 오류${head:+: $head}"; return 1
+  fi
   local summary
-  if summary="$(_check_chat "$resp" 2>&1)"; then echo "# check: $summary" >> "$TC3_RUN_DIR/step$(printf '%02d' "$step")_${slug}.log"; record "$step" "$slug" PASS "$summary"
-  else echo "# check: $summary" >> "$TC3_RUN_DIR/step$(printf '%02d' "$step")_${slug}.log"; record "$step" "$slug" FAIL "응답 검증 실패: ${summary##*$'\n'}"; return 1; fi
+  if summary="$(_check_chat "$resp" 2>&1)"; then echo "# check: $summary" >> "$lg"; record "$step" "$slug" PASS "$summary"
+  else echo "# check: $summary" >> "$lg"; record "$step" "$slug" FAIL "응답 검증 실패: ${summary##*$'\n'}"; return 1; fi
 }
 
 cmd_verify() {
-  evidence_resume
-  local rc=0
-  capture 7 models "모델 목록 API" -- "curl -sS -m 30 '$TC3_API_URL/v1/models' | python3 -m json.tool --no-ensure-ascii" || rc=1
-  local id; id="$(curl -sS -m 30 "$TC3_API_URL/v1/models" | json_get '.data[0].id' 2>/dev/null || true)"
+  evidence_resume; banner
+  local rc=0 mj="$TC3_RUN_DIR/step07_models.json"
+  rm -f "$mj"
+  capture 7 models "모델 목록 API" -- "curl -sS -m 30 '$TC3_API_URL/v1/models' | tee '$mj' | python3 -m json.tool --no-ensure-ascii" || rc=1
+  # 화면에 찍힌 바로 그 응답(step07_models.json)에서 id 를 읽는다
+  local id; id="$(json_get '.data[0].id' < "$mj" 2>/dev/null || true)"
   if (( rc == 0 )) && [[ "$id" == "$TC3_MODEL_NAME" ]]; then record 7 models PASS "id=$id"; else record 7 models FAIL "id='$id' (기대: $TC3_MODEL_NAME)"; rc=1; fi
   _chat_step 8 chat_ko "한국어 고정 프롬프트 추론" "$KO_PROMPT" || rc=1
   _chat_step 9 chat_en "영어 고정 프롬프트 추론"   "$EN_PROMPT" || rc=1
@@ -184,25 +251,36 @@ cmd_verify() {
 }
 
 cmd_soak() {
-  evidence_resume
-  local csv="$TC3_RUN_DIR/soak_result.csv"
-  if capture 10 soak "연속 요청 ${TC3_SOAK_N}회" -- "python3 '$PY/tc3_soak.py' --url '$TC3_API_URL' --model '$TC3_MODEL_NAME' --n '$TC3_SOAK_N' --timeout '$TC3_SOAK_TIMEOUT' --out '$csv'"; then
-    record 10 soak PASS "$(grep -h 'success' "$TC3_RUN_DIR/step10_soak.log" | tail -1 | tr -s ' '), $(grep -h 'latency p50' "$TC3_RUN_DIR/step10_soak.log" | tail -1 | tr -s ' '), $(grep -h 'latency p95' "$TC3_RUN_DIR/step10_soak.log" | tail -1 | tr -s ' ')"
+  evidence_resume; banner
+  local csv="$TC3_RUN_DIR/soak_result.csv" sj="$TC3_RUN_DIR/soak_summary.json" lg="$TC3_RUN_DIR/step10_soak.log"
+  rm -f "$sj"   # 이번 시도의 요약만 판정에 사용
+  local rc=0
+  capture 10 soak "연속 요청 ${TC3_SOAK_N}회" -- "python3 '$PY/tc3_soak.py' --url '$TC3_API_URL' --model '$TC3_MODEL_NAME' --n '$TC3_SOAK_N' --timeout '$TC3_SOAK_TIMEOUT' --out '$csv' --summary-json '$sj'" || rc=1
+  local note=""
+  [[ -f "$sj" ]] && note="$(python3 - "$sj" 2>/dev/null <<'PYEOF'
+import json, sys
+s = json.load(open(sys.argv[1], encoding="utf-8"))
+print("success : %d/%d (%.1f%%), latency p50 : %.3f s, latency p95 : %.3f s" % (s["ok"], s["n"], s["success_pct"], s["p50"], s["p95"]))
+PYEOF
+)"
+  if (( rc == 0 )) && [[ -n "$note" ]]; then
+    record 10 soak PASS "$note"
   else
-    record 10 soak FAIL "$(grep -h 'success' "$TC3_RUN_DIR/step10_soak.log" | tail -1 | tr -s ' ')"; return 1
+    [[ -z "$note" ]] && note="$(grep -v '^#' "$lg" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -1)"
+    record 10 soak FAIL "${note:-soak 실행 실패 — step10_soak.log 확인}"; return 1
   fi
 }
 
 cmd_stop() {
-  evidence_resume
+  evidence_resume; banner
   be_serve_stop
-  sleep 1
-  if curl -fsS -m 3 "$TC3_API_URL/v1/models" >/dev/null 2>&1; then
-    if (( SIM )); then
-      capture 11 stop "서버 정지 (외부 서버 — 시뮬레이션)" -- "curl -sS -m 3 '$TC3_API_URL/v1/models' >/dev/null && echo 'external local server still running (stop it with docker compose stop llm)'" || true
-      record 11 stop SIMULATED "외부 로컬 서버는 tc3 가 정지하지 않음"; return 0
-    fi
-    record 11 stop FAIL "서버가 아직 응답함"; return 1
+  if be_external_server && curl -fsS -m 3 "$TC3_API_URL/v1/models" >/dev/null 2>&1; then
+    capture 11 stop "서버 정지 (외부 서버 — 시뮬레이션)" -- "curl -sS -m 3 '$TC3_API_URL/v1/models' >/dev/null && echo 'external local server still running (stop it with docker compose stop llm)'" || true
+    record 11 stop SIMULATED "외부 로컬 서버는 tc3 가 정지하지 않음"; return 0
+  fi
+  # 워커 종료·NPU 해제까지 시간이 걸릴 수 있어 "연결 거부" 가 될 때까지 기다린다
+  if ! wait_down "$TC3_API_URL/v1/models" "${TC3_STOP_TIMEOUT:-60}"; then
+    record 11 stop FAIL "서버가 ${TC3_STOP_TIMEOUT:-60}s 후에도 내려가지 않음 — $(port_owner_cmd "$TC3_PORT") 로 확인"; return 1
   fi
   capture 11 stop "서버 정지 확인" -- "curl -sS -m 3 '$TC3_API_URL/v1/models' || echo 'server stopped (connection refused)'" || true
   be_accel_status 11
@@ -210,12 +288,73 @@ cmd_stop() {
 }
 
 cmd_report() {
-  evidence_resume
-  python3 "$PY/tc3_report.py" "$TC3_RUN_DIR" --backend "$TC3_BACKEND" --describe "$(be_describe)" --model "$TC3_MODEL_NAME"
+  evidence_resume; banner
+  rm -f "$TC3_RUN_DIR/report.md" "$TC3_RUN_DIR/summary.json"   # 실패 시 이전 report 가 남아 최신처럼 보이지 않도록
+  python3 "$PY/tc3_report.py" "$TC3_RUN_DIR" --backend "$TC3_BACKEND" --describe "$(be_describe)" --model "$TC3_MODEL_NAME" --kit-rev "$KIT_REV" \
+    || { fail "report 생성 실패"; return 1; }
   log "report: $TC3_RUN_DIR/report.md"
+  local overall; overall="$(json_get '.overall' < "$TC3_RUN_DIR/summary.json" 2>/dev/null)"
+  [[ "$overall" == "PASS" || "$overall" == "SIMULATED" ]]
 }
 
-cmd_status() { evidence_resume; python3 -c 'import sys,csv; rows=list(csv.reader(open(sys.argv[1],encoding="utf-8"),delimiter="\t")); w=[max(len(r[i]) if i<len(r) else 0 for r in rows) for i in range(5)]; [print("  ".join((r[i] if i<len(r) else "").ljust(w[i]) for i in range(5))) for r in rows]' "$TC3_RUN_DIR/status.tsv"; }
+cmd_status() {
+  evidence_resume
+  python3 - "$TC3_RUN_DIR/status.tsv" <<'PYEOF'
+import csv, sys, unicodedata
+# 한글 등 전각 문자는 터미널에서 2칸 → 표시 폭 기준으로 정렬
+wid = lambda s: sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+rows = [r + [""] * (5 - len(r)) for r in csv.reader(open(sys.argv[1], encoding="utf-8"), delimiter="\t")]
+w = [max(wid(r[i]) for r in rows) for i in range(5)]
+for r in rows:
+    print("  ".join(r[i] + " " * (w[i] - wid(r[i])) for i in range(5)).rstrip())
+PYEOF
+}
+
+# 시험 전 점검: 증빙에는 기록하지 않고, 문제를 한눈에 보여준다. 치명 항목이 있으면 종료코드 1.
+PF_BAD=0; PF_WARN=0
+pf_ok()   { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+pf_bad()  { printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$*"; PF_BAD=$((PF_BAD + 1)); }
+pf_warn() { printf '  %s!%s %s\n' "$C_YEL" "$C_RESET" "$*"; PF_WARN=$((PF_WARN + 1)); }
+cmd_preflight() {
+  log "preflight — $(be_describe)"
+  log "kit: $KIT_REV  host: $(hostname)  user: $(id -un)  time: $(now_iso)"
+  echo "  설정: backend=$TC3_BACKEND model=$TC3_MODEL_NAME port=$TC3_PORT api=$TC3_API_URL soak_n=$TC3_SOAK_N ready_timeout=${TC3_READY_TIMEOUT}s fixture=$TC3_FIXTURE"
+  local dirty; dirty="$(git -C "$TC3_HOME" status --porcelain --untracked-files=no 2>/dev/null | wc -l)"
+  if [[ "$KIT_REV" == "-" ]]; then pf_warn "키트가 git 저장소가 아님 (커밋 확인 불가)"
+  elif (( dirty > 0 )); then pf_warn "키트에 커밋되지 않은 수정 ${dirty}개 (git status 확인)"
+  else pf_ok "키트 커밋 $KIT_REV (수정 없음)"; fi
+  [[ -x "$TC3_HOME/bin/tc3" ]] && pf_ok "bin/tc3 실행 권한" || pf_bad "bin/tc3 실행 권한 없음 → chmod +x bin/tc3"
+  [[ -f "$ENV_FILE" ]] && pf_ok "설정 파일: $ENV_FILE" || pf_warn "설정 파일 없음: $ENV_FILE (기본값 사용) → cp tc3.env.example tc3.env"
+  have curl && pf_ok "curl" || pf_bad "curl 없음"
+  if python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then pf_ok "python3 $(python3 -c 'import platform; print(platform.python_version())')"; else pf_bad "python3 >= 3.8 없음"; fi
+  if python3 -c 'import requests, safetensors, numpy' 2>/dev/null; then pf_ok "python 패키지 requests·safetensors·numpy"; else pf_bad "python 패키지 누락 → bin/tc3 install"; fi
+  have jq && pf_ok "jq" || pf_warn "jq 없음 (python 으로 대체 — 동작에는 문제 없음)"
+  local root; root="$(evidence_root)"
+  if mkdir -p "$root" 2>/dev/null && [[ -w "$root" ]]; then
+    local free_kb; free_kb="$(df -Pk "$root" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+    if [[ -n "$free_kb" ]] && (( free_kb < 1048576 )); then pf_warn "증빙 디스크 여유 $((free_kb / 1024)) MB (< 1 GB)"; else pf_ok "증빙 디렉터리 쓰기 가능: $root"; fi
+  else pf_bad "증빙 디렉터리 쓰기 불가: $root"; fi
+  if [[ -f "$root/.current_run" ]]; then
+    local base; base="$(basename "$(cat "$root/.current_run")")"
+    if [[ "$base" == "$(date +%Y%m%d)-"* && "$base" == *"-$TC3_BACKEND" ]]; then pf_warn "오늘 run 이 이미 있음 → 이어서 기록됨: evidence/$base (새 run 을 원하면 rm evidence/.current_run)"
+    else pf_ok "다음 단계는 새 run 으로 기록됨 (이전: $base)"; fi
+  else pf_ok "다음 단계는 새 run 으로 기록됨"; fi
+  if [[ "$TC3_FIXTURE" == "1" ]]; then pf_warn "TC3_FIXTURE=1 — 합성 fixture 로 파라미터 수 산출 (시험 당일은 0)"
+  else
+    local wc; if wc="$(check_weights "$TC3_MODEL_DIR" 2>&1)"; then pf_ok "원본 가중치 완전: $TC3_MODEL_DIR"; else pf_bad "원본 가중치 문제: ${wc##*$'\n'} → bin/tc3 fetch-model"; fi
+  fi
+  if ! be_external_server; then
+    if server_alive; then pf_warn "tc3 가 띄운 서버 실행 중 (pid $(server_pid)) — serve 시 자동 재기동, 정리: bin/tc3 stop"
+    elif port_in_use "$TC3_PORT"; then pf_bad "포트 $TC3_PORT 을 다른 프로세스가 사용 중 → $(port_owner_cmd "$TC3_PORT")"
+    else pf_ok "포트 $TC3_PORT 비어 있음"; fi
+  fi
+  [[ -n "${http_proxy:-}${HTTP_PROXY:-}${https_proxy:-}${HTTPS_PROXY:-}" ]] && pf_ok "프록시 설정 감지 — 127.0.0.1/localhost 는 우회(no_proxy)"
+  pf_ok "시각대: $(date '+%Z %z')"
+  declare -F be_preflight >/dev/null && be_preflight
+  echo
+  if (( PF_BAD > 0 )); then fail "preflight: 문제 ${PF_BAD}건, 주의 ${PF_WARN}건 — 해결 후 시험 진행"; return 1; fi
+  ok "preflight: 문제 없음 (주의 ${PF_WARN}건)"
+}
 
 cmd_all() {
   evidence_init
@@ -229,7 +368,7 @@ cmd_all() {
     cmd_soak   || failed=1
   else failed=1; fi
   cmd_stop || failed=1
-  cmd_report
+  cmd_report || failed=1
   echo; cmd_status
   (( failed )) && { fail "일부 단계 실패 — $TC3_RUN_DIR 확인"; return 1; }
   ok "모든 단계 완료 — $TC3_RUN_DIR"
@@ -237,10 +376,11 @@ cmd_all() {
 
 case "$CMD" in
   install) cmd_install ;;            fetch-model) cmd_fetch_model ;;
-  platform) cmd_platform ;;          env) cmd_env ;;
-  model-size) cmd_model_size ;;      serve) cmd_serve ;;
-  verify) cmd_verify ;;              soak) cmd_soak ;;
-  stop) cmd_stop ;;                  report) cmd_report ;;
-  status) cmd_status ;;              all) cmd_all ;;
+  preflight) cmd_preflight ;;        platform) cmd_platform ;;
+  env) cmd_env ;;                    model-size) cmd_model_size ;;
+  serve) cmd_serve ;;                verify) cmd_verify ;;
+  soak) cmd_soak ;;                  stop) cmd_stop ;;
+  report) cmd_report ;;              status) cmd_status ;;
+  all) cmd_all ;;
   *) die "알 수 없는 명령: $CMD (bin/tc3 --help)" ;;
 esac

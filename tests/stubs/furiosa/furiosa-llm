@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# TEST STUB — furiosa-llm 흉내 (tests 전용, 시험 당일 사용 안 함)
+#   STUB_SERVE_MODE=ok|die|hang|stubborn   STUB_FORCE_MODEL=<id>   STUB_DELAY=<s>
+case "${1:-}" in
+  --version) echo "furiosa-llm 2026.1.0 (tc3 test stub)"; exit 0 ;;
+  serve) shift ;;
+  *) echo "stub furiosa-llm: unsupported: $*" >&2; exit 2 ;;
+esac
+art="${1:-}"; shift || true
+name=""; port=8000; devices=""
+while (( $# )); do
+  case "$1" in
+    --served-model-name) name="$2"; shift 2 ;;
+    --devices) devices="$2"; shift 2 ;;
+    --host) shift 2 ;;
+    --port) port="$2"; shift 2 ;;
+    *) echo "stub furiosa-llm: unknown option $1" >&2; exit 2 ;;
+  esac
+done
+[[ -d "$art" ]] || { echo "ERROR artifact not found: $art" >&2; exit 1; }
+echo "INFO furiosa-llm serve (stub) artifact=$art devices=$devices name=$name port=$port"
+case "${STUB_SERVE_MODE:-ok}" in
+  die)  echo "ERROR failed to acquire device ${devices} (stub: die)" >&2; exit 1 ;;
+  hang) exec sleep 100000 ;;
+  stubborn) trap '' TERM ;;   # SIGTERM 무시 (자식도 상속) → tc3 stop 이 유예 후 KILL 하는지 검증
+esac
+# 실제 furiosa-llm 처럼 워커(자식) 프로세스가 포트를 잡는다 → 부모만 죽이면 자식이 남는 상황을 재현
+python3 "$(dirname "$(readlink -f "$0")")/../fake_openai.py" --port "$port" --model "${STUB_FORCE_MODEL:-$name}" --startup-delay "${STUB_DELAY:-2}" &
+wait

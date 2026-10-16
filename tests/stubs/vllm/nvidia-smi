@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# TEST STUB — nvidia-smi 흉내 (tests 전용)
+if [[ "${1:-}" == --query-gpu* ]]; then
+  echo "name, memory.used [MiB], memory.total [MiB]"
+  echo "NVIDIA L40S, 41234 MiB, 46068 MiB"
+  exit 0
+fi
+cat <<'EOF'
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 550.00 (stub)   Driver Version: 550.00   CUDA Version: 12.4      |
+|   0  NVIDIA L40S          On  | 00000000:00:05.0 Off |                    0 |
++-----------------------------------------------------------------------------+
+EOF

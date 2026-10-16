@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# TEST STUB — lspci 흉내 (tests 전용). STUB_LSPCI=named|novendor|none|nvidia
+echo "00:00.0 Host bridge [0600]: Intel Corporation 440FX - 82441FX PMC [Natoma] [8086:1237] (rev 02)"
+echo "00:02.0 VGA compatible controller [0300]: Cirrus Logic GD 5446 [1013:00b8]"
+case "${STUB_LSPCI:-named}" in
+  named)    echo "00:05.0 Processing accelerators [1200]: FuriosaAI, Inc. Device [1ed2:0001] (rev 01)" ;;
+  novendor) echo "00:05.0 Processing accelerators [1200]: Device [1ed2:0001] (rev 01)" ;;
+  nvidia)   echo "00:05.0 3D controller [0302]: NVIDIA Corporation AD102GL [L40S] [10de:26b9] (rev a1)" ;;
+  none)     : ;;
+esac

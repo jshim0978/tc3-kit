@@ -3,12 +3,12 @@
 #   - 서버는 docker compose 의 llm 서비스(또는 수동 실행)가 띄우고, 이 백엔드는 "준비 대기 + 호출" 만 한다.
 #   - 가속기 단계는 SIMULATED 로 기록된다.
 
-be_describe()  { echo "LOCAL SIMULATION — llama.cpp server at ${TC3_API_URL} (CPU, 소형 GGUF 모델)"; }
+be_describe()  { echo "LOCAL SIMULATION — llama.cpp server at ${TC3_API_URL} (CPU, GGUF Q4_K_M)"; }
 be_simulated() { echo 1; }
+be_external_server() { return 0; }   # 서버는 docker compose 의 llm 서비스가 관리 (tc3 가 띄우거나 내리지 않음)
 
 be_install() {
-  python3 -m pip install --quiet requests safetensors numpy 2>/dev/null \
-    || python3 -m pip install --quiet --break-system-packages requests safetensors numpy
+  py_deps_install
   log "로컬 시뮬: 추론 서버는 docker compose 의 'llm' 서비스가 담당합니다 (docker/compose.local.yml)"
 }
 
@@ -33,6 +33,11 @@ be_serve_start() {
 be_accel_status() {
   local step="$1"
   capture "$step" serve_status "서버 상태 (/health)" -- "curl -sS -m 5 '$TC3_API_URL/health' || true; echo" || true
+}
+
+be_preflight() {
+  if curl -fsS -m 5 "$TC3_API_URL/v1/models" >/dev/null 2>&1; then pf_ok "llama.cpp 서버 응답: $TC3_API_URL"
+  else pf_warn "llama.cpp 서버 미응답: $TC3_API_URL (docker compose -f docker/compose.local.yml up -d llm)"; fi
 }
 
 be_serve_stop() {

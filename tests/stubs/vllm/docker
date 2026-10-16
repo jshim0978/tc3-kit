@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# TEST STUB — docker 흉내 (vLLM 백엔드 시나리오 전용, 시험 당일 사용 안 함)
+S=/tmp/tc3-stub-docker; mkdir -p "$S"
+FAKE="$(dirname "$(readlink -f "$0")")/../fake_openai.py"
+_kill() { [[ -f "$S/$1.pid" ]] && kill "$(cat "$S/$1.pid")" 2>/dev/null; rm -f "$S/$1.pid"; }
+case "${1:-}" in
+  --version) echo "Docker version 27.0.0, build stub (tc3 test stub)" ;;
+  info)      echo " Runtimes: io.containerd.runc.v2 nvidia runc" ;;
+  images)    echo "vllm/vllm-openai:stub sha256:stub 9.9GB" ;;
+  image)     [[ "${2:-}" == inspect ]] && echo "vllm/vllm-openai:stub sha256:stub 9900000000" ;;
+  pull)      echo "stub: pulled $2" ;;
+  rm)        shift; [[ "${1:-}" == -f ]] && shift; _kill "$1"; echo "$1" ;;
+  stop)      _kill "$2"; echo "$2" ;;
+  logs)      n="${*: -1}"; exec tail -n +1 -f "$S/$n.log" ;;
+  run)
+    shift; name="stub"; hostport=8000; served=""
+    while (( $# )); do
+      case "$1" in
+        --name) name="$2"; shift 2 ;;
+        --gpus|-v|-e) shift 2 ;;
+        -p) hostport="${2%%:*}"; shift 2 ;;
+        --served-model-name) served="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    python3 "$FAKE" --port "$hostport" --model "${STUB_FORCE_MODEL:-$served}" --startup-delay "${STUB_DELAY:-2}" > "$S/$name.log" 2>&1 &
+    echo $! > "$S/$name.pid"; echo "stubcontainer-$name" ;;
+  *) echo "stub docker: unsupported: $*" >&2; exit 2 ;;
+esac
