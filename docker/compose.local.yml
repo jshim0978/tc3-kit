@@ -1,0 +1,59 @@
+# 로컬(Mac/Linux) 테스트 구성 — 실제 Llama-3.1-8B-Instruct(GGUF Q4_K_M, ~4.9 GB) 를 llama.cpp 로 CPU 추론
+#
+#   # 1) 흐름만 (mock, 다운로드 없음, 1분)
+#   docker compose -f docker/compose.local.yml run --rm --no-deps tester all --backend mock
+#
+#   # 2) 실제 모델 (첫 실행 시 GGUF 다운로드, 8B CPU 추론이라 느림 → 소크 10회 권장)
+#   TC3_SOAK_N=10 docker compose -f docker/compose.local.yml up --abort-on-container-exit --exit-code-from tester
+#
+#   # 3) 원본 safetensors 로 파라미터 수까지 실측하려면 (16 GB, HF gated → HF_TOKEN 필요)
+#   mkdir -p models && huggingface-cli download meta-llama/Llama-3.1-8B-Instruct --local-dir models/Llama-3.1-8B-Instruct \
+#       --include config.json "*.safetensors" model.safetensors.index.json "tokenizer*"
+#   TC3_FIXTURE=0 TC3_SOAK_N=10 docker compose -f docker/compose.local.yml up --abort-on-container-exit --exit-code-from tester
+#
+# Docker Desktop 메모리 할당을 10 GB 이상으로 잡아야 8B Q4 모델이 올라갑니다 (Settings > Resources).
+
+services:
+  llm:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: >
+      --hf-repo ${TC3_GGUF_REPO:-bartowski/Meta-Llama-3.1-8B-Instruct-GGUF}
+      --hf-file ${TC3_GGUF_FILE:-Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf}
+      --alias ${TC3_MODEL_NAME:-Llama-3.1-8B-Instruct}
+      --host 0.0.0.0 --port 8000 -c ${TC3_CTX:-4096} --threads ${TC3_THREADS:-6}
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - LLAMA_CACHE=/root/.cache/llama.cpp
+    ports: ["8000:8000"]
+    volumes:
+      - llama-cache:/root/.cache/llama.cpp
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 90     # 모델 다운로드/적재 대기 (최대 15분)
+      start_period: 30s
+
+  tester:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.tester
+    environment:
+      TC3_BACKEND: llamacpp
+      TC3_API_URL: http://llm:8000
+      TC3_MODEL_NAME: ${TC3_MODEL_NAME:-Llama-3.1-8B-Instruct}
+      TC3_MODEL_DIR: /models/Llama-3.1-8B-Instruct
+      TC3_FIXTURE: ${TC3_FIXTURE:-1}        # 원본 safetensors 를 ../models 에 받았으면 0 으로
+      TC3_SOAK_N: ${TC3_SOAK_N:-10}
+      TC3_SOAK_TIMEOUT: "300"
+      TC3_READY_TIMEOUT: "1200"
+    volumes:
+      - ..:/kit
+      - ../models:/models
+    depends_on:
+      llm:
+        condition: service_healthy
+    command: ["all"]
+
+volumes:
+  llama-cache:

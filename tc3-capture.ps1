@@ -1,0 +1,159 @@
+<#
+.SYNOPSIS
+  TC3 로컬 시뮬레이션 — Docker(VM 대용)로 tc3-kit 절차를 단계별로 실행하고, 각 단계가 끝날 때마다
+  현재 터미널 창을 그대로 PNG 로 캡처한다 (실제 화면 캡처: GDI CopyFromScreen).
+
+.USAGE  (Windows PowerShell 5.1 / PowerShell 7, Docker Desktop 실행 중)
+  cd $HOME\repos\tc3-kit
+  Set-ExecutionPolicy -Scope Process Bypass -Force
+  .\tc3-capture.ps1                 # 기본: 소크 10회, 파라미터 수는 fixture(합성) 사용
+  .\tc3-capture.ps1 -SoakN 20       # 소크 횟수 변경
+  .\tc3-capture.ps1 -RealWeights    # models\Llama-3.1-8B-Instruct 에 원본 safetensors 가 있으면 실측(8,030,261,248)
+  .\tc3-capture.ps1 -SkipBuild      # tester 이미지 빌드 생략
+
+.OUTPUT
+  captures\<YYYYMMDD-HHMMSS>\TC3_stepNN_*.png   — 단계별 터미널 창 캡처 (실제 화면)
+  captures\<YYYYMMDD-HHMMSS>\TC3_stepNN_*.txt   — 같은 단계의 전체 출력 텍스트
+  evidence\<run>\                                — 키트가 저장하는 증빙 로그 (컨테이너가 /kit 에 기록)
+#>
+param(
+  [int]$SoakN = 10,
+  [switch]$RealWeights,
+  [switch]$SkipBuild,
+  [int]$ReadyTimeoutSec = 2400
+)
+$ErrorActionPreference = "Continue"
+$Kit = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $Kit
+$Compose = @("compose", "-f", "docker/compose.local.yml")
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$CapDir = Join-Path $Kit "captures\$Stamp"
+New-Item -ItemType Directory -Force -Path $CapDir | Out-Null
+
+# ---------- 화면 캡처 (현재 전면 창) ----------
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public static class TC3Win {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+}
+"@
+[TC3Win]::SetProcessDPIAware() | Out-Null
+
+function Snap([string]$name) {
+  Start-Sleep -Milliseconds 700
+  $h = [TC3Win]::GetForegroundWindow()
+  $r = New-Object TC3Win+RECT
+  [TC3Win]::GetWindowRect($h, [ref]$r) | Out-Null
+  $w = $r.R - $r.L; $hh = $r.B - $r.T
+  if ($w -le 0 -or $hh -le 0) { Write-Warning "창 크기를 읽지 못해 전체 화면을 캡처합니다"; $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $r.L=$b.Left; $r.T=$b.Top; $w=$b.Width; $hh=$b.Height }
+  $bmp = New-Object System.Drawing.Bitmap $w, $hh
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
+  $p = Join-Path $CapDir "$name.png"
+  $bmp.Save($p, [System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $bmp.Dispose()
+  Write-Host "  [capture] $p" -ForegroundColor DarkGray
+}
+
+function Prompt-Line([string]$cmd) {
+  Write-Host ("PS " + (Get-Location).Path + "> ") -NoNewline -ForegroundColor Yellow
+  Write-Host $cmd -ForegroundColor White
+}
+
+function Run-Step([string]$name, [string[]]$args, [string]$shown) {
+  Clear-Host
+  Prompt-Line $shown
+  $log = Join-Path $CapDir "$name.txt"
+  "PS> $shown" | Out-File -FilePath $log -Encoding utf8
+  & docker @args 2>&1 | Tee-Object -FilePath $log -Append
+  $code = $LASTEXITCODE
+  Write-Host ""
+  Prompt-Line ""
+  Snap $name
+  return $code
+}
+
+# ---------- 0) 준비 ----------
+Clear-Host
+Prompt-Line "docker version"
+docker version
+if ($LASTEXITCODE -ne 0) { Write-Error "Docker 엔진에 연결할 수 없습니다. Docker Desktop 을 실행한 뒤 다시 시도하세요."; exit 1 }
+Prompt-Line "git log -1 --oneline"
+git log -1 --oneline 2>$null
+Snap "TC3_step00_docker_and_kit"
+
+if (-not $SkipBuild) {
+  Clear-Host; Prompt-Line "docker compose -f docker/compose.local.yml build tester"
+  & docker @Compose build tester
+}
+
+$env:TC3_SOAK_N = "$SoakN"
+$env:TC3_FIXTURE = $(if ($RealWeights) { "0" } else { "1" })
+if ($RealWeights -and -not (Test-Path "$Kit\models\Llama-3.1-8B-Instruct\config.json")) {
+  Write-Warning "models\Llama-3.1-8B-Instruct 가 없어 fixture 로 진행합니다 (README B절 참고)"; $env:TC3_FIXTURE = "1"
+}
+
+# ---------- 1) 추론 서버(llama.cpp + Llama-3.1-8B-Instruct GGUF) ----------
+Clear-Host
+Prompt-Line "docker compose -f docker/compose.local.yml up -d llm"
+& docker @Compose up -d llm
+$cid = (& docker @Compose ps -q llm)
+Write-Host "llama.cpp 서버 준비 대기 (첫 실행은 GGUF 4.9GB 다운로드 + 적재) ..." -ForegroundColor Cyan
+$t0 = Get-Date
+do {
+  Start-Sleep -Seconds 15
+  $st = (& docker inspect -f '{{.State.Health.Status}}' $cid 2>$null)
+  $el = [int]((Get-Date) - $t0).TotalSeconds
+  Write-Host ("  [{0,5}s] health = {1}" -f $el, $st)
+  if ($el -gt $ReadyTimeoutSec) { Write-Error "서버 준비 시간 초과 — docker compose logs llm 확인"; exit 2 }
+} while ($st -ne "healthy")
+Prompt-Line "docker compose -f docker/compose.local.yml ps; docker compose -f docker/compose.local.yml logs --tail 12 llm"
+& docker @Compose ps
+& docker @Compose logs --tail 12 llm
+Prompt-Line "curl.exe -s http://localhost:8000/v1/models"
+curl.exe -s http://localhost:8000/v1/models | ConvertFrom-Json | ConvertTo-Json -Depth 6
+Snap "TC3_step06a_llm_server_ready"
+
+# ---------- 2) 절차 4~12 ----------
+$steps = @(
+  @{ n = "TC3_step04_env";        c = "env" },
+  @{ n = "TC3_step05_model_size"; c = "model-size" },
+  @{ n = "TC3_step06_serve";      c = "serve" },
+  @{ n = "TC3_step07-09_verify";  c = "verify" },
+  @{ n = "TC3_step10_soak";       c = "soak" },
+  @{ n = "TC3_step11_stop";       c = "stop" },
+  @{ n = "TC3_step12_report";     c = "report" }
+)
+foreach ($s in $steps) {
+  $shown = "docker compose -f docker/compose.local.yml run --rm tester " + $s.c
+  Run-Step $s.n ($Compose + @("run", "--rm", "tester", $s.c)) $shown | Out-Null
+}
+
+# report.md 전체 + 증빙 디렉터리
+$run = Get-Content (Join-Path $Kit "evidence\.current_run") -ErrorAction SilentlyContinue
+if ($run) {
+  $runWin = $run -replace '^/kit/', "$Kit\" -replace '/', '\'
+  Clear-Host
+  Prompt-Line "Get-Content $runWin\report.md"
+  Get-Content "$runWin\report.md"
+  Snap "TC3_step12_report_md"
+  Clear-Host
+  Prompt-Line "Get-ChildItem $runWin"
+  Get-ChildItem $runWin
+  Prompt-Line "docker compose -f docker/compose.local.yml run --rm tester status"
+  & docker @Compose run --rm tester status
+  Snap "TC3_step12b_evidence"
+}
+
+# ---------- 3) 정리 ----------
+Clear-Host
+Prompt-Line "docker compose -f docker/compose.local.yml stop llm"
+& docker @Compose stop llm
+Snap "TC3_step13_cleanup"
+
+Write-Host ""
+Write-Host "완료 — 캡처: $CapDir" -ForegroundColor Green
+Get-ChildItem $CapDir -Filter *.png | Select-Object Name, Length | Format-Table -AutoSize

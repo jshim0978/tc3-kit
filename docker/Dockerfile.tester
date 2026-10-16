@@ -1,0 +1,10 @@
+# 로컬 테스트용 "VM 역할" 컨테이너 — 시험용 VM(Ubuntu 22.04)과 같은 베이스에 키트 실행에 필요한 최소 패키지만 설치
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive TZ=Asia/Seoul
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip curl jq pciutils ca-certificates git bsdmainutils procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir requests safetensors numpy
+WORKDIR /kit
+ENTRYPOINT ["/kit/bin/tc3"]
+CMD ["--help"]

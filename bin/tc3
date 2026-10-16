@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# tc3 — TC3(초거대AI 모델 검증 수) 공인인증시험 수행 CLI
+#
+#   bin/tc3 <command> [--backend furiosa|vllm|llamacpp|mock] [--env FILE] [--run DIR]
+#
+# 명령 (절차서 단계 번호와 대응):
+#   install       패키지/드라이버/이미지 설치·확인 (idempotent)
+#   fetch-model   모델 가중치·artifact 다운로드 (HF_TOKEN 필요할 수 있음)
+#   platform      [1~3] 플랫폼 증빙: openstack CLI 가 있으면 hypervisor/flavor/server 조회, 없으면 MANUAL
+#   env           [4]   가속기 PCI/드라이버/실행환경 확인
+#   model-size    [5]   모델 파라미터 수 산출 (safetensors)
+#   serve         [6]   추론 서버 기동 + 준비 대기 + 적재 후 가속기 상태
+#   verify        [7~9] /v1/models, 한국어·영어 고정 프롬프트 추론
+#   soak          [10]  연속 N회 요청 (성공률·p50/p95)
+#   stop          [11]  서버 정지·원복
+#   report        증빙 디렉터리 → report.md / summary.json
+#   all           env → model-size → serve → verify → soak → stop → report  (platform 은 별도)
+#   status        현재 run 의 단계별 결과
+set -uo pipefail
+
+TC3_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export TC3_HOME
+# shellcheck source=../lib/common.sh
+source "$TC3_HOME/lib/common.sh"
+
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# ---------- 인자 ----------
+CMD="${1:-}"; [[ -z "$CMD" || "$CMD" == "-h" || "$CMD" == "--help" ]] && usage 0
+shift
+ENV_FILE="$TC3_HOME/tc3.env"
+while (( $# )); do
+  case "$1" in
+    --backend) TC3_BACKEND="$2"; shift 2 ;;
+    --env)     ENV_FILE="$2"; shift 2 ;;
+    --run)     TC3_RUN_DIR="$2"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    *) die "알 수 없는 옵션: $1" ;;
+  esac
+done
+
+# ---------- 설정 로드 (파일 < 환경변수 우선) ----------
+if [[ -f "$ENV_FILE" ]]; then
+  while IFS='=' read -r k v; do
+    [[ -z "$k" || "$k" =~ ^[[:space:]]*# ]] && continue
+    k="${k//[[:space:]]/}"; v="${v%%#*}"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    [[ -z "${!k:-}" ]] && export "$k=$v"
+  done < "$ENV_FILE"
+fi
+: "${TC3_BACKEND:=furiosa}"
+: "${TC3_PORT:=8000}"
+: "${TC3_API_URL:=http://127.0.0.1:${TC3_PORT}}"
+: "${TC3_MODEL_NAME:=Llama-3.1-8B-Instruct}"
+: "${TC3_MODEL_DIR:=/models/Llama-3.1-8B-Instruct}"
+: "${TC3_HF_REPO_MODEL:=meta-llama/Llama-3.1-8B-Instruct}"
+: "${TC3_MIN_PARAMS:=8000000000}"
+: "${TC3_ARTIFACT_DIR:=/models/furiosa-ai/Llama-3.1-8B-Instruct}"
+: "${TC3_HF_REPO_ARTIFACT:=furiosa-ai/Llama-3.1-8B-Instruct}"
+: "${TC3_DEVICES:=npu:0:*}"
+: "${TC3_VLLM_IMAGE:=vllm/vllm-openai:latest}"
+: "${TC3_SOAK_N:=100}"
+: "${TC3_SOAK_TIMEOUT:=60}"
+: "${TC3_READY_TIMEOUT:=900}"
+: "${TC3_FIXTURE:=0}"
+export TC3_BACKEND TC3_PORT TC3_API_URL TC3_MODEL_NAME TC3_MODEL_DIR TC3_MIN_PARAMS TC3_ARTIFACT_DIR TC3_DEVICES TC3_VLLM_IMAGE TC3_SOAK_N TC3_SOAK_TIMEOUT TC3_READY_TIMEOUT TC3_FIXTURE
+
+BE="$TC3_HOME/lib/backend_${TC3_BACKEND}.sh"
+[[ -f "$BE" ]] || die "지원하지 않는 백엔드: $TC3_BACKEND (furiosa|vllm|llamacpp|mock)"
+# shellcheck disable=SC1090
+source "$BE"
+SIM="$(be_simulated)"
+
+PY="$TC3_HOME/scripts"
+KO_PROMPT='대한민국의 수도와 그 도시의 대표 명소 두 곳을 세 문장으로 소개해 주세요.'
+EN_PROMPT='Explain in two sentences what an NPU is and how it differs from a GPU.'
+
+# ---------- 단계 구현 ----------
+cmd_install()     { log "backend: $(be_describe)"; be_install; }
+cmd_fetch_model() { log "backend: $(be_describe)"; be_fetch_model; }
+
+cmd_platform() {
+  evidence_resume
+  if have openstack && [[ -n "${OS_AUTH_URL:-}" ]]; then
+    local rc=0
+    capture 1 hypervisors "DUT1 하이퍼바이저 목록"      -- "openstack hypervisor list" || rc=1
+    capture 2 flavor      "가속기 패스스루 flavor"       -- "openstack flavor show '${TC3_FLAVOR:-m1.large.rngd}' -c name -c vcpus -c ram -c disk -c properties" || rc=1
+    capture 3 server      "시험용 VM 상태/배치 노드"      -- "openstack server show '${TC3_SERVER:-etri-llm-test}' -c name -c status -c flavor -c image -c addresses -c OS-EXT-SRV-ATTR:hypervisor_hostname" || rc=1
+    (( rc == 0 )) && record 1 platform PASS "openstack CLI" || record 1 platform FAIL "openstack CLI 조회 실패"
+  else
+    {
+      echo "# TC3 step 01~03 — 플랫폼 증빙 (MANUAL)"
+      echo "# time: $(now_iso)"
+      echo "openstack CLI/인증정보가 이 호스트에 없어 Horizon 화면 캡처로 대체한다:"
+      echo "  [1] Admin > Compute > Hypervisors  : compute1/compute5/compute6 목록"
+      echo "  [2] Admin > Compute > Flavors > ${TC3_FLAVOR:-m1.large.rngd} : Metadata 의 pci_passthrough:alias"
+      echo "  [3] Project > Compute > Instances > ${TC3_SERVER:-etri-llm-test} : Status=Active, Host(hypervisor), IP"
+    } > "$TC3_RUN_DIR/step01-03_platform_MANUAL.txt"
+    record 1 platform MANUAL "Horizon 캡처로 대체 (step01-03_platform_MANUAL.txt 참고)"
+  fi
+}
+
+cmd_env() {
+  evidence_resume
+  if be_env_check 4; then
+    (( SIM )) && record 4 env SIMULATED "로컬 환경 — 가속기 없음" || record 4 env PASS "가속기 인식·실행환경 확인"
+  else
+    record 4 env FAIL "가속기/드라이버 확인 실패"; return 1
+  fi
+}
+
+cmd_model_size() {
+  evidence_resume
+  local dir="$TC3_MODEL_DIR" min="$TC3_MIN_PARAMS" simnote=""
+  if [[ ! -d "$dir" || -z "$(ls "$dir"/*.safetensors 2>/dev/null)" ]]; then
+    if [[ "$TC3_FIXTURE" == "1" ]]; then
+      dir="$TC3_RUN_DIR/fixture-model"; min=1
+      python3 "$PY/make_fixture_model.py" "$dir" >/dev/null
+      simnote="fixture(합성 safetensors) 사용"
+    else
+      record 5 model_size FAIL "가중치 없음: $dir (fetch-model 먼저 실행하거나 TC3_FIXTURE=1)"; return 1
+    fi
+  fi
+  local rc=0
+  capture 5 model_ls    "모델 가중치 디렉터리"        -- "ls -lh '$dir'" || rc=1
+  capture 5 model_params "파라미터 수 산출(safetensors)" -- "python3 '$PY/tc3_count_params.py' '$dir'" || rc=1
+  be_model_extra 5 || true
+  local total
+  total="$(grep -h 'total parameters' "$TC3_RUN_DIR"/step05_model_params.log | tail -1 | sed -E 's/.*= *([0-9,]+).*/\1/' | tr -d ',')"
+  if (( rc == 0 )) && [[ -n "$total" ]] && (( total >= min )); then
+    if [[ -n "$simnote" ]]; then record 5 model_size SIMULATED "$simnote: $total params"
+    else record 5 model_size PASS "total parameters = $total (≥ $min)"; fi
+  else
+    record 5 model_size FAIL "total=$total, 기준=$min"; return 1
+  fi
+}
+
+cmd_serve() {
+  evidence_resume
+  be_serve_start
+  log "준비 대기: $TC3_API_URL/v1/models (최대 ${TC3_READY_TIMEOUT}s)"
+  if wait_http "$TC3_API_URL/v1/models" "$TC3_READY_TIMEOUT"; then
+    capture 6 serve_log "서버 기동 로그 (마지막 40줄)" -- "tail -n 40 '$TC3_RUN_DIR/server.log'" || true
+    be_accel_status 6
+    (( SIM )) && record 6 serve SIMULATED "로컬 서버 준비됨" || record 6 serve PASS "추론 서버 준비 완료"
+  else
+    capture 6 serve_log "서버 기동 로그 (실패)" -- "tail -n 80 '$TC3_RUN_DIR/server.log'" || true
+    record 6 serve FAIL "준비 시간 초과 (${TC3_READY_TIMEOUT}s)"; return 1
+  fi
+}
+
+_write_req() { # _write_req <file> <prompt>
+  python3 -c 'import json,sys; json.dump({"model":sys.argv[1],"temperature":0,"max_tokens":256,"messages":[{"role":"user","content":sys.argv[2]}]}, open(sys.argv[3],"w",encoding="utf-8"), ensure_ascii=False, indent=2)' "$TC3_MODEL_NAME" "$2" "$1"
+}
+_check_chat() { # _check_chat <response.json> → 0 if ok (요약 한 줄 출력)
+  python3 - "$1" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+c = d["choices"][0]["message"]["content"].strip()
+fr = d["choices"][0].get("finish_reason")
+assert len(c) > 0, "empty content"
+u = d.get("usage", {}) or {}
+print(f"content_len={len(c)} finish_reason={fr} completion_tokens={u.get('completion_tokens')}")
+PYEOF
+}
+_chat_step() { # _chat_step <step#> <slug> <title> <prompt>
+  local step="$1" slug="$2" title="$3" prompt="$4"
+  local req="$TC3_RUN_DIR/step$(printf '%02d' "$step")_request.json" resp="$TC3_RUN_DIR/step$(printf '%02d' "$step")_response.json"
+  _write_req "$req" "$prompt"
+  capture "$step" "$slug" "$title" -- "cat '$req'; echo; curl -sS -m 180 '$TC3_API_URL/v1/chat/completions' -H 'Content-Type: application/json' -d @'$req' | tee '$resp' | python3 -m json.tool --no-ensure-ascii" || return 1
+  local summary
+  if summary="$(_check_chat "$resp" 2>&1)"; then echo "# check: $summary" >> "$TC3_RUN_DIR/step$(printf '%02d' "$step")_${slug}.log"; record "$step" "$slug" PASS "$summary"
+  else echo "# check: $summary" >> "$TC3_RUN_DIR/step$(printf '%02d' "$step")_${slug}.log"; record "$step" "$slug" FAIL "응답 검증 실패: ${summary##*$'\n'}"; return 1; fi
+}
+
+cmd_verify() {
+  evidence_resume
+  local rc=0
+  capture 7 models "모델 목록 API" -- "curl -sS -m 30 '$TC3_API_URL/v1/models' | python3 -m json.tool --no-ensure-ascii" || rc=1
+  local id; id="$(curl -sS -m 30 "$TC3_API_URL/v1/models" | json_get '.data[0].id' 2>/dev/null || true)"
+  if (( rc == 0 )) && [[ "$id" == "$TC3_MODEL_NAME" ]]; then record 7 models PASS "id=$id"; else record 7 models FAIL "id='$id' (기대: $TC3_MODEL_NAME)"; rc=1; fi
+  _chat_step 8 chat_ko "한국어 고정 프롬프트 추론" "$KO_PROMPT" || rc=1
+  _chat_step 9 chat_en "영어 고정 프롬프트 추론"   "$EN_PROMPT" || rc=1
+  return $rc
+}
+
+cmd_soak() {
+  evidence_resume
+  local csv="$TC3_RUN_DIR/soak_result.csv"
+  if capture 10 soak "연속 요청 ${TC3_SOAK_N}회" -- "python3 '$PY/tc3_soak.py' --url '$TC3_API_URL' --model '$TC3_MODEL_NAME' --n '$TC3_SOAK_N' --timeout '$TC3_SOAK_TIMEOUT' --out '$csv'"; then
+    record 10 soak PASS "$(grep -h 'success' "$TC3_RUN_DIR/step10_soak.log" | tail -1 | tr -s ' '), $(grep -h 'latency p50' "$TC3_RUN_DIR/step10_soak.log" | tail -1 | tr -s ' '), $(grep -h 'latency p95' "$TC3_RUN_DIR/step10_soak.log" | tail -1 | tr -s ' ')"
+  else
+    record 10 soak FAIL "$(grep -h 'success' "$TC3_RUN_DIR/step10_soak.log" | tail -1 | tr -s ' ')"; return 1
+  fi
+}
+
+cmd_stop() {
+  evidence_resume
+  be_serve_stop
+  sleep 1
+  if curl -fsS -m 3 "$TC3_API_URL/v1/models" >/dev/null 2>&1; then
+    if (( SIM )); then
+      capture 11 stop "서버 정지 (외부 서버 — 시뮬레이션)" -- "curl -sS -m 3 '$TC3_API_URL/v1/models' >/dev/null && echo 'external local server still running (stop it with docker compose stop llm)'" || true
+      record 11 stop SIMULATED "외부 로컬 서버는 tc3 가 정지하지 않음"; return 0
+    fi
+    record 11 stop FAIL "서버가 아직 응답함"; return 1
+  fi
+  capture 11 stop "서버 정지 확인" -- "curl -sS -m 3 '$TC3_API_URL/v1/models' || echo 'server stopped (connection refused)'" || true
+  be_accel_status 11
+  record 11 stop PASS "서버 정지·원복"
+}
+
+cmd_report() {
+  evidence_resume
+  python3 "$PY/tc3_report.py" "$TC3_RUN_DIR" --backend "$TC3_BACKEND" --describe "$(be_describe)" --model "$TC3_MODEL_NAME"
+  log "report: $TC3_RUN_DIR/report.md"
+}
+
+cmd_status() { evidence_resume; python3 -c 'import sys,csv; rows=list(csv.reader(open(sys.argv[1],encoding="utf-8"),delimiter="\t")); w=[max(len(r[i]) if i<len(r) else 0 for r in rows) for i in range(5)]; [print("  ".join((r[i] if i<len(r) else "").ljust(w[i]) for i in range(5))) for r in rows]' "$TC3_RUN_DIR/status.tsv"; }
+
+cmd_all() {
+  evidence_init
+  log "run dir: $TC3_RUN_DIR"
+  log "backend: $(be_describe)"
+  local failed=0
+  cmd_env        || failed=1
+  cmd_model_size || failed=1
+  if cmd_serve; then
+    cmd_verify || failed=1
+    cmd_soak   || failed=1
+  else failed=1; fi
+  cmd_stop || failed=1
+  cmd_report
+  echo; cmd_status
+  (( failed )) && { fail "일부 단계 실패 — $TC3_RUN_DIR 확인"; return 1; }
+  ok "모든 단계 완료 — $TC3_RUN_DIR"
+}
+
+case "$CMD" in
+  install) cmd_install ;;            fetch-model) cmd_fetch_model ;;
+  platform) cmd_platform ;;          env) cmd_env ;;
+  model-size) cmd_model_size ;;      serve) cmd_serve ;;
+  verify) cmd_verify ;;              soak) cmd_soak ;;
+  stop) cmd_stop ;;                  report) cmd_report ;;
+  status) cmd_status ;;              all) cmd_all ;;
+  *) die "알 수 없는 명령: $CMD (bin/tc3 --help)" ;;
+esac

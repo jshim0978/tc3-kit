@@ -1,0 +1,6 @@
+evidence/
+models/
+tc3.env
+__pycache__/
+*.pyc
+.DS_Store
