@@ -13,6 +13,7 @@
 | 0 | `git clone <REPO> && cd tc3-kit && cp tc3.env.example tc3.env` | clone 완료, `git log -1` 커밋 | 10 s |
 | 0c | `bin/tc3 install` | `[1/6]~[6/6]` 후 `PASS install 완료` (종료코드 0) — **종료코드 3 이면 재부팅 필요** | 5–15 min (apt + pip ≈ 수 GB) |
 | 0c' | (3 이면) `sudo reboot` → 재접속 → `bin/tc3 install` | 설치된 항목은 확인만, `PASS install 완료` | 2–5 min |
+| 0e | `bin/tc3 hf-login` | **시험원이 HF 토큰 붙여넣기**(화면에 안 보임) → `PASS HF 접근 확인: <계정> → meta-llama/Llama-3.1-8B-Instruct` | 30 s |
 | 0d | `bin/tc3 fetch-model` | 디스크 여유 확인 → 원본 가중치 16 GB + artifact → `PASS fetch-model 완료` | 5–40 min (회선 속도) |
 | 0b | `bin/tc3 preflight` | `preflight: 문제 없음` (고정 버전 일치·SDK import·FXB·포트) | 5 s |
 | 4 | `bin/tc3 env` | `PASS [step 04] env` — lspci `1ed2`, furiosa-smi info/status, furiosa-llm 버전 | 5 s |
@@ -22,12 +23,17 @@
 | 10 | `bin/tc3 soak` | `success : 100/100 (100.0%)`, p50/p95, PASS (줄 단위 실시간 표시) | 2–5 min |
 | 11 | `bin/tc3 stop` | `server stopped (connection refused)` + `furiosa-smi ps` 비어 있음, PASS | 5–30 s |
 | 12 | `bin/tc3 report` / `cat evidence/<run>/report.md` | 종합 **PASS**, A~D | 2 s |
+| 끝 | `bin/tc3 hf-logout` (캡처 불필요) | 저장된 토큰 삭제 — 공용 VM 에 토큰을 남기지 않음 | 2 s |
 
 - install·fetch-model 의 전체 출력은 증빙 `evidence/<run>/prep_install.log`, `prep_fetch_model.log` 에도 남는다.
 - 각 단계 첫 줄 `[tc3] run: evidence/<YYYYMMDD-HHMMSS>-furiosa backend: furiosa kit: <commit>` 으로 캡처와 증빙이 1:1 연결.
 - 실패 시 종료코드 ≠ 0 과 `[tc3] FAIL ...` 한 줄 원인. 같은 단계를 다시 하면 같은 run 에 기록되고 report "재수행 이력"에 남는다.
 - 절차 1~3(플랫폼)은 Horizon 캡처.
-- 이 PC 에서 같은 순서로 실행·캡처: `tc3-capture-vm.ps1 -Target llmvm -Clone -RepoUrl <REPO> -Install -Fetch -AllowReboot`
+- 이 PC 에서 같은 순서로 실행·캡처: `tc3-capture-vm.ps1 -Target llmvm -Clone -RepoUrl <REPO> -Install -HfLogin -Fetch -AllowReboot`
+  (hf-login 단계에서 알림음 → 사람이 그 창에 토큰을 붙여넣고 Enter. 자동화는 토큰을 입력하지 않는다)
+- 원본 가중치는 공식 `meta-llama/Llama-3.1-8B-Instruct` (gated) — 라이선스 동의한 HF 계정 토큰으로 `bin/tc3 hf-login` (2026-10-16 결정).
+  `hf auth login` 대신 쓰는 이유: hub 1.x 의 `hf auth login` 은 브라우저 로그인 메뉴(화살표 선택)가 먼저 떠 원격 터미널에서 실수 여지가 있음.
+  `hf-login` 은 숨김 입력으로 받은 토큰을 `huggingface_hub.login()` 에 stdin 으로 넘겨 같은 위치(`~/.cache/huggingface/token`)에 저장한다.
 
 ## 2. 버전 고정 (당일 install 이 설치하는 조합 — `tc3.env.example`)
 
@@ -53,10 +59,10 @@
    (커널 < 6.3 이면 install 이 HWE 커널 설치 후 재부팅을 요구 — 원복 시 커널 처리 주의, 4절)
 4. **네트워크**: `curl -sI https://github.com https://huggingface.co https://pypi.org http://asia-northeast3-apt.pkg.dev | grep HTTP`
    + 프록시 여부. 막혀 있으면 오프라인 반입 계획으로 전환.
-5. **HF 원본 가중치 접근**: `meta-llama/Llama-3.1-8B-Instruct` 는 gated — 라이선스 동의한 계정 토큰 필요(`hf auth login`, 입력은 화면에 안 보임).
-   토큰을 쓰지 않으려면 비-gated 미러(`unsloth/Meta-Llama-3.1-8B-Instruct`, 인덱스·파라미터 수 동일, config.json 은 다름)로 바꿀 수 있음 — **결정 필요**.
-6. **당일과 같은 전체 흐름 + 캡처** (이 PC, 보이는 창):
-   `Start-Process wt.exe -ArgumentList '-w new --size 160,60 -d C:\Users\etri-jws\repos\tc3-kit powershell -NoExit -ExecutionPolicy Bypass -File .\tc3-capture-vm.ps1 -Target llmvm -Clone -RepoUrl <REPO> -Install -Fetch -AllowReboot'`
+5. **HF 원본 가중치 접근** (결정: 공식 meta-llama): 사용자가 Llama 3.1 라이선스 동의한 HF 계정을 제공 → install 후 `bin/tc3 hf-login` 에서 사용자가 토큰 입력.
+   원복 때 `~/.cache/huggingface`(토큰 포함)가 지워지므로 시험 당일 다시 `hf-login` 한다.
+6. **당일과 같은 전체 흐름 + 캡처** (이 PC, 보이는 창 — hf-login 단계에서 사용자가 토큰 입력):
+   `Start-Process wt.exe -ArgumentList '-w new --size 160,60 -d C:\Users\etri-jws\repos\tc3-kit powershell -NoExit -ExecutionPolicy Bypass -File .\tc3-capture-vm.ps1 -Target llmvm -Clone -RepoUrl <REPO> -Install -HfLogin -Fetch -AllowReboot'`
    → install/fetch-model **소요 시간 실측**해서 1절 표에 기록.
 7. **실기기 확인 항목**: serve 두 번, serve 중 stop, stop 후 `furiosa-smi ps` 빈 것, soak 100회 시간, 서버 기동 시간(`TC3_READY_TIMEOUT` 여유),
    `furiosa-smi ps` 출력 형식, Ray 데몬 잔존 여부(조합 A).
@@ -85,7 +91,8 @@ ssh llmvm '/var/tmp/vm-state.sh diff /var/tmp/tc3-baseline.txt'                 
 | install `Could not get lock` | 부팅 직후 자동 업데이트 | install 이 최대 10분 대기 — 그대로 둔다 |
 | install 종료코드 3 | 커널/드라이버 적재 | `sudo reboot` → 재접속 → `bin/tc3 install` |
 | install "PCI 에 FuriosaAI 장치 없음" | NPU 패스스루 문제 | 재부팅으로 해결 안 됨 — 인프라(flavor/호스트) 확인 |
-| fetch-model "HF 접근 불가(gated)" | 토큰 없음/라이선스 미동의 | `hf auth login` 후 재실행 |
+| fetch-model "HF 접근 불가(gated)" | 로그인 안 함/라이선스 미동의 | `bin/tc3 hf-login` 후 재실행 |
+| hf-login "로그인 실패" | 토큰 오타·만료·권한 | huggingface.co/settings/tokens 에서 read 토큰 확인 후 재입력 |
 | fetch-model "디스크 여유 부족" | /models 공간 | 볼륨 확인 (필요 ≥ 40 GB) |
 | preflight `✗ ... ≠ 고정 버전` | 다른 버전 설치됨 | `bin/tc3 install` (고정 버전으로 맞춤) |
 | preflight `✗ 포트 8000 사용 중` | 이전 서버/다른 프로세스 | `bin/tc3 stop` → `ss -ltnp 'sport = :8000'` |
@@ -97,6 +104,6 @@ ssh llmvm '/var/tmp/vm-state.sh diff /var/tmp/tc3-baseline.txt'                 
 
 ## 6. 검증 근거
 
-- `tests/run_scenarios.sh`: Ubuntu 22.04 컨테이너에서 47개 시나리오 (정상 흐름, furiosa/vllm 스텁 경로 + 실제 가중치, 서버 즉시 사망·시간 초과·이중 기동·포트 점유·SIGTERM 무시·리더만 사망, 잘못된 모델 id·비JSON·빈 응답·간헐 실패·도중 사망, CRLF/BOM/따옴표 tc3.env, 프록시, 비루트, LANG=C, 심볼릭 링크, 백엔드 전환, 날짜 넘김, 실제 HF 다운로드).
+- `tests/run_scenarios.sh`: Ubuntu 22.04 컨테이너에서 48개 시나리오 (정상 흐름, furiosa/vllm 스텁 경로 + 실제 가중치, 서버 즉시 사망·시간 초과·이중 기동·포트 점유·SIGTERM 무시·리더만 사망, 잘못된 모델 id·비JSON·빈 응답·간헐 실패·도중 사망, CRLF/BOM/따옴표 tc3.env, 프록시, 비루트, LANG=C, 심볼릭 링크, 백엔드 전환, 날짜 넘김, 실제 HF 다운로드).
 - `tests/vm-sim`: 깨끗한 Ubuntu 22.04(SSH) 에서 clone → install(실제 pkg.dev 저장소 등록, venv + uv) → 전 단계 → 캡처 → `vm-state.sh` 원복 → 재현.
 - 실행: `docker compose -f docker/compose.local.yml run --rm --no-deps -T --entrypoint bash tester /kit/tests/run_scenarios.sh`

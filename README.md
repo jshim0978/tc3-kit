@@ -8,7 +8,9 @@ AI반도체 클라우드 플랫폼(openKcloud, DUT1)의 OpenStack VM 위에서 *
 bin/tc3 <command> [--backend furiosa|vllm|llamacpp|mock]
 
   install       패키지/드라이버/이미지 설치·확인 (idempotent)
+  hf-login      HF 로그인 (토큰 숨김 입력) + 원본 가중치 저장소 접근 확인 — fetch-model 전에
   fetch-model   모델 가중치·artifact 다운로드
+  hf-logout     저장된 HF 토큰 삭제 (시험 후)
   preflight     시험 전 점검 (가속기·furiosa-llm·가중치·포트·파이썬 패키지) — 증빙에 기록 안 함
   platform      [1~3] 플랫폼 증빙 (openstack CLI 있으면 자동, 없으면 Horizon 캡처 안내)
   env           [4]   가속기 PCI/드라이버/실행환경 확인
@@ -96,7 +98,8 @@ cp tc3.env.example tc3.env            # TC3_BACKEND=furiosa (기본값)
 
 # 2) 사전 준비 (리허설 때 1회; 당일은 확인만)
 bin/tc3 install                       # 드라이버·furiosa-smi·furiosa-llm 확인(없으면 설치)
-HF_TOKEN=hf_xxx bin/tc3 fetch-model   # 원본 가중치 + RNGD artifact → /models
+bin/tc3 hf-login                      # HF 토큰 숨김 입력 (gated meta-llama 저장소)
+bin/tc3 fetch-model                   # 원본 가중치 + RNGD artifact → /models
 
 # 3) 시험 (단계별로 화면 캡처)
 bin/tc3 preflight    # 사전 점검 (✗ 가 있으면 해결 후 진행)
@@ -112,7 +115,7 @@ bin/tc3 report       # report.md
 플랫폼 증빙 [1~3] 은 Horizon(또는 master3 의 openstack CLI)에서 캡처합니다: Hypervisors / Flavor `m1.large.rngd` 의 `pci_passthrough:alias` / Instance `etri-llm-test` 의 Status·Host·IP.
 
 ## 검증 · 런북
-- `tests/run_scenarios.sh` — Ubuntu 22.04 컨테이너에서 47개 시나리오(정상·고장 주입·운영 실수) 자동 검증:
+- `tests/run_scenarios.sh` — Ubuntu 22.04 컨테이너에서 48개 시나리오(정상·고장 주입·운영 실수) 자동 검증:
   `docker compose -f docker/compose.local.yml run --rm --no-deps -T --entrypoint bash tester /kit/tests/run_scenarios.sh`
 - `docs/VM_RUNBOOK.md` — 리허설 체크리스트, SDK 버전별 결정표, 원복(wipe), 당일 장애 대응
 - `tc3-capture-vm.ps1` — VM 에서 SSH 로 절차를 실행하며 단계별 터미널 화면 캡처 (`tests/vm-sim` 으로 리허설 가능)

@@ -406,6 +406,25 @@ sc_port_mismatch() {
   chk "warns when API URL port != TC3_PORT" has "$SC_LOG" "TC3_PORT($PORT)"
 }
 
+sc_hf_login_flow() {
+  fresh hf_login_flow furiosa; furiosa_env
+  python3 -c 'import huggingface_hub' 2>/dev/null || python3 -m pip install -q huggingface_hub >/dev/null 2>&1 \
+    || { skip "huggingface_hub 설치 불가 (네트워크)"; return; }
+  export HF_HOME="$SC_DIR/hfhome" TC3_FIXTURE=0 TC3_MODEL_DIR="$SC_DIR/no-weights"
+  local fake="hf_TC3FAKEtoken0123456789abcdef"
+  printf '%s\n' "$fake" | "$TC3" hf-login --env "$SC_ENV" >> "$SC_LOG" 2>&1
+  chk "invalid token → hf-login exit != 0" is "$(( $? != 0 ))" 1
+  chk "token never printed" hasnt "$SC_LOG" "TC3FAKEtoken"
+  chk "token not in evidence" bash -c "! grep -rq TC3FAKEtoken '$TC3_EVIDENCE_DIR' 2>/dev/null"
+  chk "no token stored after failed login" test ! -e "$HF_HOME/token"
+  printf '\n' | "$TC3" hf-login --env "$SC_ENV" >> "$SC_LOG" 2>&1
+  chk "empty token → exit != 0" is "$(( $? != 0 ))" 1
+  chk "explains empty token" has "$SC_LOG" "토큰이 비어 있습니다"
+  t hf-logout; chk "hf-logout when not logged in → exit 0" is $? 0
+  t preflight
+  chk "preflight hints hf-login when weights missing" has "$SC_LOG" "bin/tc3 hf-login"
+}
+
 sc_fetch_model_net() {
   fresh fetch_model_net furiosa; furiosa_env
   python3 -c 'import huggingface_hub' 2>/dev/null || python3 -m pip install -q huggingface_hub >/dev/null 2>&1 \
@@ -522,7 +541,7 @@ ALL=(mock_all mock_steps furiosa_full serve_dies_fast serve_timeout serve_twice 
      env_quotes_nonl symlink_and_cwd no_jq lang_c rerun_step stale_run report_incomplete stop_nothing cli_misuse platform_manual
      soak_100 lspci_novendor lspci_none vllm_full ctrl_c_serve path_with_spaces nonroot timezone
      proxy_env env_bom soak_live_output backend_switch preflight_ok preflight_bad stop_stubborn old_sdk
-     port_mismatch leader_dies ver_compare report_stale_soak platform_os_fail fetch_model_net)
+     port_mismatch leader_dies ver_compare report_stale_soak platform_os_fail hf_login_flow fetch_model_net)
 
 i=0
 for name in "${ALL[@]}"; do

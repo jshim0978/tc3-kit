@@ -5,8 +5,9 @@
 
 .USAGE  (보이는 새 Windows Terminal 창에서 실행 — 캡처 대상은 이 스크립트를 띄운 터미널 창)
   Start-Process wt.exe -ArgumentList '-w new --size 160,60 -d C:\Users\etri-jws\repos\tc3-kit powershell -NoExit -ExecutionPolicy Bypass -File .\tc3-capture-vm.ps1 -Target llmvm'
-  깨끗한 VM 기준 당일 순서: -Clone -RepoUrl <url> -Install -Fetch -AllowReboot
-    (clone → install [재부팅 필요 시 sudo reboot → 재접속 → install 재확인] → fetch-model → preflight → 절차 4~12)
+  깨끗한 VM 기준 당일 순서: -Clone -RepoUrl <url> -Install -HfLogin -Fetch -AllowReboot
+    (clone → install [재부팅 필요 시 sudo reboot → 재접속 → install 재확인] → hf-login → fetch-model → preflight → 절차 4~12)
+    -HfLogin: 이 창에 "HF 토큰 입력" 이 뜨면 사람이 직접 토큰을 붙여넣고 Enter (화면에 표시되지 않음, 자동 입력하지 않음)
   옵션: -KitDir ~/tc3-kit  -Steps env,model-size,...  -RepoUrl <url> (-Clone 과 함께: 새로 clone 하는 장면부터 캡처)
         -SshConfig <ssh config 파일> (점프 호스트/포트/키)  -SshArgs '-p','2222'  -NoPreflight  -NoFetch
 
@@ -22,6 +23,7 @@ param(
   [string]$RepoUrl = "",
   [switch]$Clone,
   [switch]$Install,
+  [switch]$HfLogin,
   [switch]$Fetch,
   [switch]$AllowReboot,
   [switch]$NoPreflight,
@@ -165,6 +167,12 @@ if ($Install) {
     $Results["TC3_step00c_install2"] = Step "TC3_step00c_install2" @("bin/tc3 install")
   }
   if ("$($Results[@($Results.Keys)[-1]])" -ne "0") { Write-Error "install 실패 — 이후 단계 중단"; Show-Summary 1 }
+}
+if ($HfLogin) {
+  # 사람이 이 창에 토큰을 입력해야 하는 단계 — 알림음으로 알린다 (스크립트는 토큰을 입력하지 않음)
+  try { [console]::Beep(880, 250); [console]::Beep(1175, 250) } catch { }
+  $Results["TC3_step00e_hf_login"] = Step "TC3_step00e_hf_login" @("bin/tc3 hf-login")
+  if ($Results["TC3_step00e_hf_login"] -ne 0) { Write-Error "hf-login 실패 — 이후 단계 중단"; Show-Summary 1 }
 }
 if ($Fetch) {
   $Results["TC3_step00d_fetch_model"] = Step "TC3_step00d_fetch_model" @("bin/tc3 fetch-model")

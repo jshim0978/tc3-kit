@@ -135,7 +135,7 @@ be_fetch_model() {
   free="$(df -Pk "$TC3_MODEL_DIR" | awk 'NR == 2 { print int($4 / 1048576) }')"
   if (( free < need )); then fail "디스크 여유 ${free} GB < ${need} GB ($TC3_MODEL_DIR) — 가중치(~16 GB)+artifact 저장 공간 부족"; return 1; fi
   ok "디스크 여유 ${free} GB (필요 ≥ ${need} GB)"
-  hf_access "$TC3_HF_REPO_MODEL" || return 1
+  hf_access "$TC3_HF_REPO_MODEL" || { fail "→ bin/tc3 hf-login 으로 로그인한 뒤 다시 실행"; return 1; }
   log "원본 가중치(파라미터 수 산출용): $TC3_HF_REPO_MODEL → $TC3_MODEL_DIR"
   hf_download "$TC3_HF_REPO_MODEL" "$TC3_MODEL_DIR" "" "*.json" "*.safetensors" "tokenizer*" || return 1
   check_weights "$TC3_MODEL_DIR" || { fail "가중치 다운로드 불완전 — fetch-model 재실행"; return 1; }

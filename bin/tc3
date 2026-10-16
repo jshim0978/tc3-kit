@@ -5,7 +5,9 @@
 #
 # 명령 (절차서 단계 번호와 대응):
 #   install       패키지/드라이버/이미지 설치·확인 (idempotent)
-#   fetch-model   모델 가중치·artifact 다운로드 (HF_TOKEN 필요할 수 있음)
+#   hf-login      HF 로그인 (토큰 숨김 입력) + 원본 가중치 저장소 접근 확인 — gated 저장소용, fetch-model 전에
+#   fetch-model   모델 가중치·artifact 다운로드
+#   hf-logout     저장된 HF 토큰 삭제 (시험 후)
 #   preflight     시험 전 점검 (가속기·서버 실행파일·가중치·포트·파이썬 패키지) — 증빙에 기록하지 않음
 #   platform      [1~3] 플랫폼 증빙: openstack CLI 가 있으면 hypervisor/flavor/server 조회, 없으면 MANUAL
 #   env           [4]   가속기 PCI/드라이버/실행환경 확인
@@ -117,6 +119,40 @@ _prep() { # _prep <이름> <함수>
 }
 cmd_install()     { evidence_resume; banner; log "install — $(be_describe)"; _prep install be_install; }
 cmd_fetch_model() { evidence_resume; banner; log "fetch-model — $(be_describe)"; _prep fetch_model be_fetch_model; }
+
+# HF 로그인 (gated 원본 가중치용): 토큰을 숨김 입력으로 받아 huggingface_hub.login() 에 stdin 으로 넘긴다.
+#  - `hf auth login` 은 버전에 따라 브라우저 로그인 메뉴(화살표 선택)가 먼저 떠서 원격 터미널에서 실수 여지가 있음
+#  - 토큰은 화면·프로세스 목록(argv)·로그 어디에도 남지 않고, 표준 위치(~/.cache/huggingface/token)에 저장된다
+_hf_whoami() { python3 -c 'from huggingface_hub import whoami; print(whoami()["name"])' 2>/dev/null; }
+cmd_hf_login() {
+  evidence_resume; banner
+  python3 -c 'import huggingface_hub' 2>/dev/null || { fail "huggingface_hub 가 없습니다 — bin/tc3 install 먼저"; return 1; }
+  local who tok=""
+  if who="$(_hf_whoami)" && [[ -n "$who" ]]; then
+    ok "이미 HF 로그인됨: $who"
+  else
+    read -rsp "HF 토큰 입력 (huggingface.co/settings/tokens — 입력 내용은 화면에 표시되지 않음): " tok; echo
+    [[ -n "$tok" ]] || { fail "토큰이 비어 있습니다"; return 1; }
+    if ! printf '%s' "$tok" | python3 -c 'import sys
+from huggingface_hub import login
+login(token=sys.stdin.read().strip(), add_to_git_credential=False)' >/dev/null 2>&1; then
+      unset tok; fail "HF 로그인 실패 — 토큰이 올바른지 확인 (read 권한 이상)"; return 1
+    fi
+    unset tok
+    who="$(_hf_whoami)" || true
+    [[ -n "$who" ]] || { fail "로그인 후 계정 확인 실패 (네트워크/프록시 확인)"; return 1; }
+    ok "HF 로그인: $who"
+  fi
+  hf_access "$TC3_HF_REPO_MODEL" || { fail "계정 $who 로 $TC3_HF_REPO_MODEL 에 접근할 수 없음 — huggingface.co 에서 Llama 3.1 라이선스 동의 확인"; return 1; }
+  { echo "# TC3 prep — hf_login  time: $(now_iso)  account: $who  repo: $TC3_HF_REPO_MODEL  access: OK  (토큰 값은 기록하지 않음)"; } >> "$TC3_RUN_DIR/prep_hf_login.log"
+  ok "HF 접근 확인: $who → $TC3_HF_REPO_MODEL"
+}
+cmd_hf_logout() {
+  python3 -c 'import huggingface_hub' 2>/dev/null || { warn "huggingface_hub 없음 — 저장된 토큰도 없음"; return 0; }
+  python3 -c 'from huggingface_hub import logout; logout()' >/dev/null 2>&1 || true
+  if [[ -n "$(_hf_whoami)" ]]; then fail "로그아웃 후에도 토큰이 남아 있음 (HF_TOKEN 환경변수 확인)"; return 1; fi
+  ok "HF 로그아웃 — 저장된 토큰 삭제"
+}
 
 cmd_platform() {
   evidence_resume; banner
@@ -353,7 +389,12 @@ cmd_preflight() {
   else pf_ok "다음 단계는 새 run 으로 기록됨"; fi
   if [[ "$TC3_FIXTURE" == "1" ]]; then pf_warn "TC3_FIXTURE=1 — 합성 fixture 로 파라미터 수 산출 (시험 당일은 0)"
   else
-    local wc; if wc="$(check_weights "$TC3_MODEL_DIR" 2>&1)"; then pf_ok "원본 가중치 완전: $TC3_MODEL_DIR"; else pf_bad "원본 가중치 문제: ${wc##*$'\n'} → bin/tc3 fetch-model"; fi
+    local wc; if wc="$(check_weights "$TC3_MODEL_DIR" 2>&1)"; then pf_ok "원본 가중치 완전: $TC3_MODEL_DIR"
+    else
+      pf_bad "원본 가중치 문제: ${wc##*$'\n'} → bin/tc3 fetch-model"
+      local hu; hu="$(_hf_whoami)"
+      if [[ -n "$hu" ]]; then pf_ok "HF 로그인: $hu (fetch-model 가능)"; else pf_warn "HF 미로그인 — gated 저장소면 bin/tc3 hf-login 후 fetch-model"; fi
+    fi
   fi
   if ! be_external_server; then
     if server_alive; then pf_warn "tc3 가 띄운 서버 실행 중 (pid $(server_pid)) — serve 시 자동 재기동, 정리: bin/tc3 stop"
@@ -388,6 +429,7 @@ cmd_all() {
 
 case "$CMD" in
   install) cmd_install ;;            fetch-model) cmd_fetch_model ;;
+  hf-login) cmd_hf_login ;;          hf-logout) cmd_hf_logout ;;
   preflight) cmd_preflight ;;        platform) cmd_platform ;;
   env) cmd_env ;;                    model-size) cmd_model_size ;;
   serve) cmd_serve ;;                verify) cmd_verify ;;

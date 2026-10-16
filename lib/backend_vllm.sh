@@ -46,6 +46,7 @@ be_preflight() {
 be_fetch_model() {
   export HF_TOKEN="${HF_TOKEN:-}"
   mkdir -p "$TC3_MODEL_DIR"
+  hf_access "$TC3_HF_REPO_MODEL" || return 1
   hf_download "$TC3_HF_REPO_MODEL" "$TC3_MODEL_DIR" "" "*.json" "*.safetensors" "tokenizer*" || return 1
   check_weights "$TC3_MODEL_DIR" || { fail "가중치 다운로드 불완전 — fetch-model 재실행"; return 1; }
   ok "fetch-model 완료"

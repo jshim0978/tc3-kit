@@ -224,7 +224,7 @@ try:
     auth_check(repo)
     print(f"HF 접근 가능: {repo}")
 except GatedRepoError:
-    sys.exit(f"HF 접근 불가(gated): {repo} — 라이선스 동의한 계정의 토큰 필요: `hf auth login` (입력이 화면에 표시되지 않음)")
+    sys.exit(f"HF 접근 불가(gated): {repo} — 라이선스 동의한 계정으로 로그인 필요: bin/tc3 hf-login (토큰 입력은 화면에 표시되지 않음)")
 except RepositoryNotFoundError:
     sys.exit(f"HF 저장소 없음 또는 비공개: {repo}")
 except Exception as e:  # noqa: BLE001
