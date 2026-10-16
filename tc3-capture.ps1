@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   TC3 로컬 시뮬레이션 — Docker(VM 대용)로 tc3-kit 절차를 단계별로 실행하고, 각 단계가 끝날 때마다
   현재 터미널 창을 그대로 PNG 로 캡처한다 (실제 화면 캡처: GDI CopyFromScreen).
@@ -23,21 +23,28 @@ param(
   [int]$ReadyTimeoutSec = 2400
 )
 $ErrorActionPreference = "Continue"
+# 컨테이너 출력(UTF-8)의 한글이 깨지지 않도록 콘솔 인코딩을 UTF-8 로 (Windows PowerShell 5.1 기본은 CP949)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
 $Kit = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Kit
 $Compose = @("compose", "-f", "docker/compose.local.yml")
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $CapDir = Join-Path $Kit "captures\$Stamp"
 New-Item -ItemType Directory -Force -Path $CapDir | Out-Null
+# 이전 실행의 run 포인터가 남아 있으면 새 증빙 디렉터리 대신 옛 run 에 누적되므로 제거
+Remove-Item (Join-Path $Kit "evidence\.current_run") -ErrorAction SilentlyContinue
 
 # ---------- 화면 캡처 (현재 전면 창) ----------
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @"
 using System; using System.Runtime.InteropServices;
 public static class TC3Win {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
 "@
@@ -47,7 +54,8 @@ function Snap([string]$name) {
   Start-Sleep -Milliseconds 700
   $h = [TC3Win]::GetForegroundWindow()
   $r = New-Object TC3Win+RECT
-  [TC3Win]::GetWindowRect($h, [ref]$r) | Out-Null
+  # DWMWA_EXTENDED_FRAME_BOUNDS(9): Windows 10/11 의 보이지 않는 테두리를 뺀 실제 창 영역 (실패 시 GetWindowRect)
+  if ([TC3Win]::DwmGetWindowAttribute($h, 9, [ref]$r, 16) -ne 0) { [TC3Win]::GetWindowRect($h, [ref]$r) | Out-Null }
   $w = $r.R - $r.L; $hh = $r.B - $r.T
   if ($w -le 0 -or $hh -le 0) { Write-Warning "창 크기를 읽지 못해 전체 화면을 캡처합니다"; $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $r.L=$b.Left; $r.T=$b.Top; $w=$b.Width; $hh=$b.Height }
   $bmp = New-Object System.Drawing.Bitmap $w, $hh
@@ -63,13 +71,17 @@ function Prompt-Line([string]$cmd) {
   Write-Host $cmd -ForegroundColor White
 }
 
-function Run-Step([string]$name, [string[]]$args, [string]$shown) {
+function Run-Step([string]$name, [string[]]$dockerArgs, [string]$shown) {
+  # $args 는 PowerShell 자동 변수라 파라미터 이름으로 쓰면 바인딩되지 않는다 → $dockerArgs
   Clear-Host
   Prompt-Line $shown
   $log = Join-Path $CapDir "$name.txt"
-  "PS> $shown" | Out-File -FilePath $log -Encoding utf8
-  & docker @args 2>&1 | Tee-Object -FilePath $log -Append
+  $sw = New-Object System.IO.StreamWriter($log, $false, (New-Object System.Text.UTF8Encoding($false)))
+  $sw.WriteLine("PS> $shown")
+  # 출력은 Out-Host 로 화면에 직접 보낸다 (함수 출력은 호출측 | Out-Null 에 버려짐). stderr 레코드는 문자열로 변환.
+  & docker @dockerArgs 2>&1 | ForEach-Object { $line = "$_"; $sw.WriteLine($line); $sw.Flush(); $line } | Out-Host
   $code = $LASTEXITCODE
+  $sw.Close()
   Write-Host ""
   Prompt-Line ""
   Snap $name
@@ -138,7 +150,7 @@ if ($run) {
   $runWin = $run -replace '^/kit/', "$Kit\" -replace '/', '\'
   Clear-Host
   Prompt-Line "Get-Content $runWin\report.md"
-  Get-Content "$runWin\report.md"
+  Get-Content "$runWin\report.md" -Encoding UTF8
   Snap "TC3_step12_report_md"
   Clear-Host
   Prompt-Line "Get-ChildItem $runWin"
