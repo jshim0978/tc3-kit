@@ -151,13 +151,12 @@ if os.path.exists(_att):
             if int(x[0]) in multi:
                 lines.append(f"| {x[0]} | {x[2]} | {md(x[3] if len(x) > 3 else '')} | {x[4] if len(x) > 4 else ''} |")
         lines.append("")
+# 증빙 파일은 한 문단으로 (목록이 길어 report 화면 캡처에서 종합 판정이 위로 밀려나지 않도록)
+files = [os.path.basename(fn) for fn in sorted(glob.glob(os.path.join(a.run_dir, "step*")))]
+files += [x for x in ["server.log", "soak_result.csv", "soak_summary.json", "attempts.tsv"] if os.path.exists(os.path.join(a.run_dir, x))]
 lines.append("## 증빙 파일")
 lines.append("")
-for fn in sorted(glob.glob(os.path.join(a.run_dir, "step*"))):
-    lines.append(f"- `{os.path.basename(fn)}`")
-for extra in ["server.log", "soak_result.csv", "soak_summary.json", "attempts.tsv"]:
-    if os.path.exists(os.path.join(a.run_dir, extra)):
-        lines.append(f"- `{extra}`")
+lines.append(", ".join(f"`{x}`" for x in files))
 lines.append("")
 lines.append("## 결론")
 lines.append("")
@@ -177,4 +176,6 @@ json.dump({"overall": overall, "simulated": simulated, "backend": a.backend, "mo
            "criteria": {k: verdict(v) for k, v in CRITERIA.items()},
            "steps": {int(r["step"]): {"name": r["name"], "result": r["result"], "note": r["note"], "time": r["time"]} for r in rows}},
           open(os.path.join(a.run_dir, "summary.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-print("\n".join(lines[:12]))
+# 화면에는 종합 판정 + 판정 증빙 4종까지 (전체는 report.md)
+cut = next((i for i, ln in enumerate(lines) if ln.startswith("## 단계별 결과")), 12)
+print("\n".join(lines[:cut]).rstrip())

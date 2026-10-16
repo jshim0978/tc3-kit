@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   TC3 — 시험용 VM 에서 키트 절차를 SSH 로 실행하고, 단계마다 이 PC 의 터미널 창을 PNG 로 캡처한다.
   시험 당일과 같은 화면: VM 의 bash 프롬프트(user@host:~/tc3-kit$) + 명령 + 실제 출력(색 포함, ssh pty).
@@ -6,7 +6,7 @@
 .USAGE  (보이는 새 Windows Terminal 창에서 실행 — 캡처 대상은 이 스크립트를 띄운 터미널 창)
   Start-Process wt.exe -ArgumentList '-w new --size 160,60 -d C:\Users\etri-jws\repos\tc3-kit powershell -NoExit -ExecutionPolicy Bypass -File .\tc3-capture-vm.ps1 -Target llmvm'
   옵션: -KitDir ~/tc3-kit  -Steps env,model-size,...  -RepoUrl <url> (-Clone 과 함께: 새로 clone 하는 장면부터 캡처)
-        -SshArgs '-p','2222','-i','key'  -NoPreflight  -NoFetch
+        -SshConfig <ssh config 파일> (점프 호스트/포트/키)  -SshArgs '-p','2222'  -NoPreflight  -NoFetch
 
 .OUTPUT
   captures\<YYYYMMDD-HHMMSS>-vm\TC3_stepNN_*.png  + evidence\<run>\ (VM 에서 scp 로 가져온 증빙)
@@ -16,12 +16,15 @@ param(
   [string]$KitDir = "~/tc3-kit",
   [string[]]$Steps = @("env", "model-size", "serve", "verify", "soak", "stop", "report"),
   [string[]]$SshArgs = @(),
+  [string]$SshConfig = "",
   [string]$RepoUrl = "",
   [switch]$Clone,
   [switch]$NoPreflight,
   [switch]$NoFetch
 )
 $ErrorActionPreference = "Continue"
+# 별도 ssh 설정 파일 (점프 호스트·포트·키를 담은 config) — powershell -File 로도 넘길 수 있는 단일 문자열 인자
+if ($SshConfig) { $SshArgs = @("-F", $SshConfig) + $SshArgs }
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -76,7 +79,8 @@ function Snap([string]$name) {
 # 명령을 VM 의 bash 스크립트로 만들어 base64 로 보낸다 (PowerShell 5.1 의 인자 따옴표 문제 회피).
 # 스크립트는 VM 의 실제 프롬프트 형식(Ubuntu 기본 PS1 색)으로 "user@host:~/dir$ 명령" 을 찍고 명령을 실행한다.
 function Invoke-Vm([string[]]$commands, [string]$cwd = $KitDir, [switch]$Quiet) {
-  $lines = @('cd ' + $cwd + ' 2>/dev/null || cd ~',
+  # 주의: PowerShell 에서 , 가 + 보다 먼저 결합 → 첫 원소는 괄호로 감싸야 함
+  $lines = @(('cd ' + $cwd + ' 2>/dev/null || cd ~'),
              'P="$(printf ''\033[01;32m%s@%s\033[00m:\033[01;34m%s\033[00m$ '' "$(id -un)" "$(hostname -s)" "$(dirs +0)")"',
              'rc=0')
   foreach ($c in $commands) {
@@ -89,8 +93,12 @@ function Invoke-Vm([string[]]$commands, [string]$cwd = $KitDir, [switch]$Quiet) 
   $script = ($lines -join "`n") + "`n"
   $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
   $remote = "echo $b64 | base64 -d > /tmp/.tc3_capture_step.sh && bash /tmp/.tc3_capture_step.sh; r=`$?; rm -f /tmp/.tc3_capture_step.sh; exit `$r"
-  & ssh -t @SshArgs $Target $remote
-  return $LASTEXITCODE
+  # ssh 를 콘솔에 직접 연결해 실행 (출력을 변수로 받으면 화면에 아무것도 안 남음 → 캡처가 빈 창이 됨)
+  $argv = @("-t") + $SshArgs + @($Target, $remote) | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
+  $p = Start-Process -FilePath "ssh" -ArgumentList ($argv -join ' ') -NoNewWindow -PassThru
+  $null = $p.Handle   # PS 5.1: 핸들을 잡아 두지 않으면 ExitCode 가 비는 문제
+  $p.WaitForExit()
+  return $p.ExitCode
 }
 function Get-Vm([string]$cmd) { (& ssh @SshArgs $Target $cmd 2>$null | Out-String).Trim() }
 
