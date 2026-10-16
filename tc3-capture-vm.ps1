@@ -104,7 +104,9 @@ function Invoke-Vm([string[]]$commands, [string]$cwd = $KitDir, [switch]$Quiet) 
   $p.WaitForExit()
   return $p.ExitCode
 }
-function Get-Vm([string]$cmd) { (& ssh @SshArgs $Target $cmd 2>$null | Out-String).Trim() }
+# 비대화형 조회: -n (stdin 을 읽지 않음 — Windows ssh 가 콘솔 stdin 을 붙잡고 끝나지 않는 문제 방지), BatchMode (암호·확인 프롬프트로 멈추지 않음)
+$NonInteractive = @("-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15")
+function Get-Vm([string]$cmd) { (& ssh @NonInteractive @SshArgs $Target $cmd 2>$null | Out-String).Trim() }
 
 function Step([string]$name, [string[]]$commands, [string]$cwd = $KitDir) {
   Clear-Host
@@ -151,7 +153,7 @@ if ($run) {
     $dst = Join-Path $CapDir "evidence"; New-Item -ItemType Directory -Force -Path $dst | Out-Null
     Write-Host "증빙 가져오기: scp -r ${Target}:$run $dst" -ForegroundColor Cyan
     $ScpArgs = @($SshArgs | ForEach-Object { if ($_ -ceq '-p') { '-P' } else { $_ } })   # scp 의 포트 옵션은 -P
-    & scp -r -q @ScpArgs "${Target}:$run" $dst
+    & scp -r -q -o BatchMode=yes -o ConnectTimeout=15 @ScpArgs "${Target}:$run" $dst
   }
 }
 

@@ -112,7 +112,7 @@ bin/tc3 report       # report.md
 플랫폼 증빙 [1~3] 은 Horizon(또는 master3 의 openstack CLI)에서 캡처합니다: Hypervisors / Flavor `m1.large.rngd` 의 `pci_passthrough:alias` / Instance `etri-llm-test` 의 Status·Host·IP.
 
 ## 검증 · 런북
-- `tests/run_scenarios.sh` — Ubuntu 22.04 컨테이너에서 43개 시나리오(정상·고장 주입·운영 실수) 자동 검증:
+- `tests/run_scenarios.sh` — Ubuntu 22.04 컨테이너에서 47개 시나리오(정상·고장 주입·운영 실수) 자동 검증:
   `docker compose -f docker/compose.local.yml run --rm --no-deps -T --entrypoint bash tester /kit/tests/run_scenarios.sh`
 - `docs/VM_RUNBOOK.md` — 리허설 체크리스트, SDK 버전별 결정표, 원복(wipe), 당일 장애 대응
 - `tc3-capture-vm.ps1` — VM 에서 SSH 로 절차를 실행하며 단계별 터미널 화면 캡처 (`tests/vm-sim` 으로 리허설 가능)

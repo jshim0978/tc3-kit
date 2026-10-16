@@ -51,8 +51,9 @@
 | artifact | `furiosa-ai/Llama-3.1-8B-Instruct@v2025.x` | `@v2026.1` | `@v2026.2` / `@v2026.3` | FXB 필요 → `furiosa-ai/Meta-Llama-3.1-8B-Instruct-FP8-dynamic@v2026.4` |
 | `huggingface-cli` | 동작 | 동작 | 없음(`hf`) | 없음(`hf`) |
 
-⚠ `--served-model-name` 미지원 버전이면 `/v1/models` id 가 `Llama-3.1-8B-Instruct` 와 달라 절차 7 이 FAIL 할 수 있다 → 리허설에서 id 를 확인하고, 필요하면 SDK 업그레이드(드라이버·smi·furiosa-llm 같은 릴리스로) 또는 키트 조정.
-키트는 설치된 버전을 읽어 플래그를 자동 선택하고(`fetch-model` 은 맞는 태그를 자동 선택), `preflight` 가 불일치를 경고한다.
+⚠ `--served-model-name` 미지원 버전이면 `/v1/models` id 가 `Llama-3.1-8B-Instruct` 와 달라 절차 7~10 이 FAIL 한다 → `preflight` 가 ✗ 로 막는다. 리허설에서 SDK 업그레이드(드라이버·smi·furiosa-llm 같은 릴리스로) 여부를 결정.
+키트는 설치된 버전을 읽어 플래그를 자동 선택하고(`fetch-model` 은 맞는 태그를 자동 선택, 출처는 `<artifact 경로>.tc3_source` 에 기록), `preflight` 가 SDK import·버전·FXB 를 점검한다.
+`bin/tc3 install` 은 SDK 가 쓰는 파이썬의 기존 패키지를 **업그레이드하지 않고** 없는 것만 설치한다 (furiosa-llm 의존성 보호).
 
 ## 3. 원복(wipe) — 리허설 후, 당일 전
 
@@ -84,5 +85,5 @@ furiosa-smi ps                                # NPU 점유 프로세스 없음 �
 
 ## 5. 검증 근거
 
-- `tests/run_scenarios.sh`: Ubuntu 22.04 컨테이너에서 43개 시나리오 (정상 흐름, furiosa/vllm 스텁 경로 + 실제 가중치, 서버 즉시 사망·시간 초과·이중 기동·포트 점유·SIGTERM 무시, 잘못된 모델 id·비JSON·빈 응답·간헐 실패·도중 사망, CRLF/BOM/따옴표 tc3.env, 프록시, 비루트, LANG=C, 심볼릭 링크, 백엔드 전환, 날짜 넘김, 실제 HF 다운로드).
+- `tests/run_scenarios.sh`: Ubuntu 22.04 컨테이너에서 47개 시나리오 (정상 흐름, furiosa/vllm 스텁 경로 + 실제 가중치, 서버 즉시 사망·시간 초과·이중 기동·포트 점유·SIGTERM 무시, 잘못된 모델 id·비JSON·빈 응답·간헐 실패·도중 사망, CRLF/BOM/따옴표 tc3.env, 프록시, 비루트, LANG=C, 심볼릭 링크, 백엔드 전환, 날짜 넘김, 실제 HF 다운로드).
 - 실행: `docker compose -f docker/compose.local.yml run --rm --no-deps -T --entrypoint bash tester /kit/tests/run_scenarios.sh`
