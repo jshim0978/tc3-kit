@@ -25,6 +25,7 @@ ap.add_argument("--describe", default="")
 ap.add_argument("--model", default="")
 ap.add_argument("--kit-rev", default="")
 ap.add_argument("--files", action="store_true")
+ap.add_argument("--only", default="", help="--files 와 함께: 이 이름(glob)의 파일만 출력, 예: step10_soak.log, 'step04_*'")
 ap.add_argument("--zip", action="store_true")
 ap.add_argument("--quiet", action="store_true")
 a = ap.parse_args()
@@ -61,15 +62,28 @@ if a.files:
         for fn in sorted(glob.glob(p(pat))):
             if os.path.basename(fn) not in order:
                 order.append(os.path.basename(fn))
+    if a.only:
+        import fnmatch
+        order = [n for n in order if fnmatch.fnmatch(n, a.only)]
     shown = 0
     for name in order:
         t = read(name)
         if t is None:
             continue
-        if name == "step10_soak.log":   # 100줄 진행 기록 대신 요약 블록만
+        if name == "step10_soak.log":   # 100줄 진행 기록 대신 요약 블록 + 한/영 질의응답 표본
             lines = t.splitlines()
-            keep = [ln for ln in lines if ln.startswith("#") or any(k in ln for k in ("requests", "success", "latency", "error", "FAIL", "ERR"))]
+            keep = [ln for ln in lines if ln.startswith("#") or any(k in ln for k in ("requests", "success", "latency", "by language", "error", "FAIL", "ERR"))]
             t = "\n".join(keep[-40:]) + "\n"
+            samples = []
+            for ln in (read("soak_answers.jsonl") or "").splitlines()[:12]:
+                try:
+                    j = json.loads(ln)
+                except ValueError:
+                    continue
+                ans = " ".join(str(j.get("answer", "")).split())
+                samples.append(f"[{j['idx']:3d}] {j['lang']}·{j['category']}  Q: {j['prompt'][:70]}\n      A: {ans[:110]}")
+            if samples:
+                t += "\n# 질의응답 표본 (처음 12건, 전문: soak_answers.jsonl)\n" + "\n".join(samples) + "\n"
         print(f"===== {name} =====")
         print(t.rstrip())
         print()

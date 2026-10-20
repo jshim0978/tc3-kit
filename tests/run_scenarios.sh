@@ -416,6 +416,10 @@ sc_run_mock() {
   t result --files; chk "result --files exit 0" is $? 0
   chk "files: prep_check first" has "$SC_LOG" "===== prep_check.log ====="
   chk "files: soak summary" has "$SC_LOG" "===== step10_soak.log ====="
+  : > "$SC_DIR/only.log"; "$TC3" result --files --only step10_soak.log --env "$SC_ENV" > "$SC_DIR/only.log" 2>&1
+  chk "result --files --only shows just that section" bash -c "grep -q '===== step10_soak.log' '$SC_DIR/only.log' && ! grep -q 'prep_check' '$SC_DIR/only.log'"
+  chk "soak section has KO/EN Q&A samples" bash -c "grep -q '질의응답 표본' '$SC_DIR/only.log' && grep -q 'EN·' '$SC_DIR/only.log' && grep -q 'KO·' '$SC_DIR/only.log'"
+  chk "soak answers saved (100 unique prompts, KO+EN)" bash -c "test \$(wc -l < '$R/soak_answers.jsonl') -eq 5 && grep -q '\"lang\": \"EN\"' '$R/soak_answers.jsonl'"
   t result --zip; chk "result --zip exit 0" is $? 0
   chk "zip created" test -s "$R.zip"
   noproc mock_openai_server.py && noproc tc3_npu_monitor.py || OK=0

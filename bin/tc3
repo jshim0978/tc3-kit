@@ -8,7 +8,7 @@
 #   live          ② 시험 스크립트 재생 — 왼쪽 run 실시간 출력, 오른쪽 NPU 상태 패널(1초) [tmux]. tmux 없으면 run --inline-monitor
 #   run           ② 재생 (한 화면): preflight → env → model-size → serve → verify → soak → stop → report, NPU 모니터·그래프
 #                    [--soak-n N] [--from <단계>] [--keep-going] [--inline-monitor] [--no-monitor]
-#   result        ③ 결과 저장·확인 — RESULT.md 생성 후 출력  [--files 주요 로그 출력] [--zip 제출용 압축]
+#   result        ③ 결과 저장·확인 — RESULT.md 생성 후 출력  [--files 주요 로그 출력] [--only <파일> 한 부분만] [--zip 제출용 압축]
 #
 # 사전준비(리허설) 명령:
 #   install       패키지/드라이버/이미지 설치·확인 (idempotent)
@@ -41,7 +41,7 @@ usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' 
 CMD="${1:-}"; [[ -z "$CMD" || "$CMD" == "-h" || "$CMD" == "--help" ]] && usage 0
 shift
 ENV_FILE="$TC3_HOME/tc3.env"
-RUN_FROM=""; RUN_KEEP=""; RUN_MON="on"; RESULT_FILES=""; RESULT_ZIP=""
+RUN_FROM=""; RUN_KEEP=""; RUN_MON="on"; RESULT_FILES=""; RESULT_ZIP=""; RESULT_ONLY=""
 while (( $# )); do
   case "$1" in
     --backend|--env|--run|--soak-n|--from) [[ $# -ge 2 && -n "$2" ]] || die "$1 다음에 값이 필요합니다" ;;&
@@ -54,6 +54,7 @@ while (( $# )); do
     --inline-monitor) RUN_MON=inline; shift ;;
     --no-monitor)     RUN_MON=off; shift ;;
     --files) RESULT_FILES=1; shift ;;
+    --only)  [[ $# -ge 2 && -n "$2" ]] || die "--only 다음에 파일 이름(glob)이 필요합니다"; RESULT_ONLY="$2"; shift 2 ;;
     --zip)   RESULT_ZIP=1; shift ;;
     -h|--help) usage 0 ;;
     *) die "알 수 없는 옵션: $1" ;;
@@ -729,6 +730,7 @@ cmd_result() {
   [[ -n "$TC3_RUN_DIR" && -d "$TC3_RUN_DIR" ]] || die "결과를 만들 run 이 없습니다 — bin/tc3 run 먼저 (또는 --run <evidence/run>)"
   export TC3_RUN_DIR
   local mode=(); [[ -n "$RESULT_FILES" ]] && mode+=(--files); [[ -n "$RESULT_ZIP" ]] && mode+=(--zip)
+  [[ -n "${RESULT_ONLY:-}" ]] && mode+=(--files --only "$RESULT_ONLY")
   python3 "$PY/tc3_result.py" "$TC3_RUN_DIR" --backend "$TC3_BACKEND" --describe "$(be_describe)" --model "$TC3_MODEL_NAME" --kit-rev "$KIT_REV" "${mode[@]}"
 }
 

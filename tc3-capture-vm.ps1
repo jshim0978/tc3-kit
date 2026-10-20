@@ -34,7 +34,9 @@ param(
   #   예: -Mode prep,run,result   (지정하면 절차 4~12 개별 단계 캡처 대신 이 흐름을 캡처)
   [string[]]$Mode = @(),
   # -Mode run: 단계가 끝난 화면을 유지할 시간(초) — 그 사이에 단계별 캡처 (화면에는 표시되지 않음)
-  [double]$PhaseHold = 2.5
+  [double]$PhaseHold = 2.5,
+  # -Mode run: soak 진행 중 캡처 간격(초)
+  [int]$SoakEvery = 15
 )
 $ErrorActionPreference = "Continue"
 # powershell -File 로 실행하면 배열 인자가 "a,b" 한 문자열로 들어오므로 쉼표로 나눈다
@@ -179,21 +181,80 @@ function Step([string]$name, [string[]]$commands, [string]$cwd = $KitDir) {
 
 # 시험 스크립트 재생 캡처: 재생을 띄워 둔 채, VM 의 <현재 run>/phase 변화를 SSH 한 연결로 지켜보다가
 # 단계가 바뀔 때마다(=앞 단계 출력이 끝난 화면) TC3_run_NN_<단계>.png, 끝나면 TC3_run_done.png 를 찍는다.
+# ---------- 캡처 목록 (INDEX.md): 순번 · 파일 · 단계 · 화면의 명령 · 설명 — 시험절차서 작성용 ----------
+$script:Seq = 0
+$script:Index = New-Object System.Collections.Generic.List[object]
+$D = @{
+  "env_vm"            = "시험 환경 — 호스트 이름, OS(Ubuntu 22.04), 커널, CPU 수, 메모리, 디스크 여유";
+  "env_npu"           = "NPU 인식 — lspci 의 FuriosaAI RNGD(PCI 벤더 1ed2), furiosa-smi info(펌웨어·온도·전력·PCI 주소), furiosa-smi status(유휴: 메모리 0, 코어 '-')";
+  "env_sdk"           = "드라이버·SDK 버전 — furiosa-driver-rngd·furiosa-smi(apt 패키지), furiosa-llm(venv) — 검증한 고정 조합, python 버전";
+  "env_models"        = "모델 파일 — 원본 가중치 safetensors 4개(16.06 GB, 파라미터 수 산출용)와 RNGD 컴파일 artifact(16.52 GB, v2026.3, 서빙용)";
+  "env_kit"           = "시험 키트 커밋과 설정 파일(tc3.env)의 값 — 백엔드·모델 이름·포트·연속 요청 횟수·경로";
+  "start_menu"        = "시험 실행기 ./start.sh 메뉴 — 1 사전준비 확인 / 2 시험 스크립트 재생 / 3 결과 보기 / a 전부, 각 항목이 실행하는 bin/tc3 명령";
+  "start1_preflight"  = "./start.sh 1 = bin/tc3 preflight — 사전준비 항목(버전·모델 파일·포트·디스크·시계·NPU 점유)을 기대값/실제값 표로 확인 → PASS, 다음 단계 안내";
+  "run_preflight"     = "./start.sh 2 = bin/tc3 live 시작 — 왼쪽: 재생 전 자동 사전준비 확인(실패하면 시험을 시작하지 않음), 오른쪽: NPU 상태 패널(1초 갱신)";
+  "step04_env"        = "절차 4 env — lspci 로 RNGD 확인, furiosa-smi info/status, furiosa-llm·python·커널 버전 → PASS";
+  "step05_model_size" = "절차 5 model-size — 원본 safetensors 의 텐서 합산: total parameters = 8,030,261,248 (8.03 B) → PASS";
+  "serve_loading"     = "절차 6 serve 진행 중 — furiosa-llm serve 기동·준비 대기. NPU 를 여는 동안 오른쪽 패널은 조회를 잠시 멈춤(장치 충돌 방지)";
+  "step06_serve"      = "절차 6 serve 완료 — 서버 준비, 기동 로그, NPU 메모리 적재(약 42.5/47.5 GiB), furiosa-smi ps 에 furiosa-llm 프로세스 → PASS";
+  "step07_models"     = "절차 7 — /v1/models 응답: id = Llama-3.1-8B-Instruct (요청에 쓰는 모델 이름과 일치) → PASS";
+  "step08_chat_ko"    = "절차 8 — 한국어 고정 프롬프트 추론: 요청 JSON 과 한국어 응답, finish_reason=stop → PASS";
+  "step09_chat_en"    = "절차 9 — 영어 고정 프롬프트 추론: 요청 JSON 과 영어 응답, finish_reason=stop → PASS";
+  "soak_progress"     = "절차 10 soak 진행 — 서로 다른 100문항(한국어 50·영어 50, 10개 유형)을 연속 요청: 줄마다 순번·소요·토큰·언어·유형·응답 앞부분, 오른쪽은 NPU 코어 사용률";
+  "step10_soak"       = "절차 10 soak 완료 — 성공 100/100(100%), 언어별 성공 수, 응답시간 p50/p95/최대 → PASS";
+  "step11_stop"       = "절차 11 stop — 서버 정지(connection refused), NPU 메모리 해제·점유 프로세스 없음 → PASS";
+  "step12_report"     = "절차 12 report — NPU 점유 요약(구간별 평균·최대 사용률, 메모리, 전력, 온도)과 판정 보고서(A~D) → 종합 PASS";
+  "done"              = "재생 종료 — 단계별 결과·소요 시간 표와 총 소요, '재생 완료'";
+  "start2_summary"    = "./start.sh 2 종료 — 실행기의 한 줄 요약(완료·소요·결과 경로)과 다음 단계(3) 안내";
+  "start3_result"     = "./start.sh 3 = bin/tc3 result && bin/tc3 result --files — RESULT.md 생성·출력 후 주요 로그 출력 (화면은 끝부분, 실행기 요약)";
+  "result_md_1"       = "RESULT.md (1) — 시험항목·VM/OS·가속기·모델·키트·재생 시각·사전준비 결과, 종합 판정과 판정 증빙 A~D";
+  "result_md_2"       = "RESULT.md (2) — E. NPU 점유 요약표, 연속 요청(D) 통계";
+  "result_md_3"       = "RESULT.md (3) — 단계별 결과(절차 04~11)와 단계별 소요 시간";
+  "result_md_4"       = "RESULT.md (4) — 증빙 파일 목록(크기·sha256 앞 16자)과 결론";
+  "files_prep_check"  = "result --files: 사전준비 확인 표 원본 (prep_check.log)";
+  "files_env"         = "result --files: 절차 4 로그 — lspci·furiosa-smi info/status·버전";
+  "files_params"      = "result --files: 절차 5 로그 — 파라미터 수 산출 상세(파일별 크기, 텐서 수, config, index 교차확인)";
+  "files_serve_log"   = "result --files: 절차 6 서버 기동 로그(furiosa-llm: artifact 적재, 병렬 구성, KV 캐시, Uvicorn 시작)";
+  "files_npu_status"  = "result --files: 절차 6 NPU 상태 로그 — 적재 후 메모리·코어, 점유 프로세스";
+  "files_models"      = "result --files: 절차 7 로그 — /v1/models 응답";
+  "files_chat_ko"     = "result --files: 절차 8 로그 — 한국어 요청·응답 전문";
+  "files_chat_en"     = "result --files: 절차 9 로그 — 영어 요청·응답 전문";
+  "files_soak"        = "result --files: 절차 10 로그 요약(성공률·언어별·응답시간) + 한국어/영어 질의응답 표본 12건";
+  "files_stop"        = "result --files: 절차 11 로그 — 서버 정지 확인, NPU 해제";
+  "files_npu_summary" = "result --files: NPU 점유 요약(npu_summary.txt)";
+  "evidence_ls"       = "증빙 디렉터리 전체 파일 목록";
+  "evidence_sha"      = "증빙 무결성 — SHA256SUMS 로 모든 파일 해시 확인";
+  "result_zip"        = "제출용 압축 생성 — bin/tc3 result --zip";
+}
+function Next-Name([string]$label) { $script:Seq++; return ("TC3_{0:D2}_{1}" -f $script:Seq, $label) }
+function Add-Index([string]$file, [string]$stage, [string]$cmd, [string]$desc) {
+  $script:Index.Add([pscustomobject]@{ Seq = $script:Seq; File = "$file.png"; Stage = $stage; Cmd = $cmd; Desc = $desc })
+}
+# Cap <라벨> <단계> <명령들> — 한 장 캡처 + 목록 기록
+function Cap([string]$label, [string]$stage, [string[]]$commands) {
+  $n = Next-Name $label
+  $rc = Step $n $commands
+  Add-Index $n $stage ($commands -join " ; ") $D[$label]
+  $Results[$n] = $rc
+  return $rc
+}
+
+# 시험 스크립트 재생 캡처: 재생을 띄워 둔 채, VM 의 <현재 run> 을 SSH 한 연결로 지켜보며
+#   절차 단계 기록(status.tsv) 마다 · serve 기동 중 · soak 진행 중(일정 간격) · report · 재생 종료 · 실행기 요약을 찍는다.
 function Run-Phases([string]$cmd) {
-  $num = @{ "preflight" = "00"; "env" = "04"; "model-size" = "05"; "serve" = "06"; "verify" = "07-09"; "soak" = "10"; "stop" = "11"; "report" = "12" }
-  # VM 쪽 감시: 끝난 단계는 run_timing.tsv 의 새 행으로(빠른 단계도 놓치지 않음), 현재 단계는 phase 파일로 알린다
-  $watch = @(('cd ' + $KitDir + ' 2>/dev/null || exit 1'), 'run=""; rows=0; last=""; first=1',
+  $stepLabel = @{ "04" = "step04_env"; "05" = "step05_model_size"; "06" = "step06_serve"; "07" = "step07_models";
+                  "08" = "step08_chat_ko"; "09" = "step09_chat_en"; "10" = "step10_soak"; "11" = "step11_stop" }
+  $watch = @(('cd ' + $KitDir + ' 2>/dev/null || exit 1'), 'run=""; rows=0; srows=0; last=""; first=1',
              'while :; do',
-             '  r="$(cat evidence/.current_run 2>/dev/null)"; f="$r/run_timing.tsv"',
+             '  r="$(cat evidence/.current_run 2>/dev/null)"; f="$r/run_timing.tsv"; s="$r/status.tsv"',
              '  if [ "$r" != "$run" ]; then',
-             '    if [ $first = 1 ]; then rows=$(cat "$f" 2>/dev/null | wc -l); first=0; else rows=0; fi',
-             '    run="$r"; echo "BASE|$r|$rows"',
+             '    if [ $first = 1 ]; then rows=$(cat "$f" 2>/dev/null | wc -l); srows=$(cat "$s" 2>/dev/null | wc -l); first=0; else rows=0; srows=0; fi',
+             '    run="$r"; echo "BASE|$r|$rows|$srows"',
              '  fi',
              '  new="$(tail -n +$((rows + 1)) "$f" 2>/dev/null)"',
-             '  if [ -n "$new" ]; then',
-             '    printf "%s\n" "$new" | awk -F "\t" ''NF >= 6 && $1 != "phase" { print "ROW|" $1 "|" $6 }''',
-             '    rows=$((rows + $(printf "%s\n" "$new" | wc -l)))',
-             '  fi',
+             '  if [ -n "$new" ]; then printf "%s\n" "$new" | awk -F "\t" ''NF >= 6 && $1 != "phase" { print "ROW|" $1 "|" $6 }''; rows=$((rows + $(printf "%s\n" "$new" | wc -l))); fi',
+             '  n=$(cat "$s" 2>/dev/null | wc -l); [ "$n" -lt "$srows" ] && srows=$n',
+             '  if [ "$n" -gt "$srows" ]; then tail -n +$((srows + 1)) "$s" | awk -F "\t" ''NF >= 3 && $1 != "step" { print "STEP|" $1 "|" $2 "|" $3 }''; srows=$n; fi',
              '  p="$(cat "$r/phase" 2>/dev/null)"; if [ "$p" != "$last" ]; then echo "PHASE|$p"; last="$p"; fi',
              '  sleep 0.3',
              'done') -join "`n"
@@ -201,20 +262,20 @@ function Run-Phases([string]$cmd) {
   $wout = Join-Path $CapDir ".phase_watch.txt"; $werr = Join-Path $CapDir ".phase_watch.err"
   $wargs = ($NonInteractive + $SshArgs + @($Target, "echo $wb64 | base64 -d | bash")) | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
   $wp = Start-Process -FilePath "ssh" -ArgumentList ($wargs -join ' ') -NoNewWindow -PassThru -RedirectStandardOutput $wout -RedirectStandardError $werr
-  # 감시가 기준선(BASE)을 보낸 뒤에 재생을 시작한다
   $t0 = Get-Date; while (-not ((Test-Path $wout) -and (Get-Item $wout).Length -gt 0) -and ((Get-Date) - $t0).TotalSeconds -lt 20) { Start-Sleep -Milliseconds 200 }
   Clear-Host
   $script:SnapQuiet = $true
-  # 재생이 단계 끝 화면을 잠시 유지하게 해서(TC3_PHASE_HOLD) 그 사이에 찍는다 — 다음 단계 출력이 섞이지 않음
+  $stage = "② $cmd"
   $p = Invoke-Vm @($cmd) -NoWait -Exports @("TC3_PHASE_HOLD=$PhaseHold")
-  $seen = 0; $prevPhase = ""; $done = $false; $shot = @{}
+  $seen = 0; $phase = ""; $done = $false; $shot = @{}; $serveAt = $null; $soakAt = $null; $prog = 0
   $log = Join-Path $CapDir "steps.tsv"
-  function Shot([string]$ph) {
-    if (-not $num.ContainsKey($ph) -or $shot.ContainsKey($ph)) { return }
-    Start-Sleep -Milliseconds 300   # 단계 끝줄(→ PASS)이 그려지도록 — 재생은 TC3_PHASE_HOLD 동안 이 화면을 유지
-    $n = "TC3_run_{0}_{1}" -f $num[$ph], $ph
-    Snap $n; $shot[$ph] = 1
-    "{0}`t-`t{1} (단계 {2} 끝)" -f $n, $cmd, $ph | Out-File -Append -Encoding utf8 $log
+  function Shot([string]$label, [string]$descKey, [int]$delayMs = 300) {
+    if ($shot.ContainsKey($label)) { return }
+    Start-Sleep -Milliseconds $delayMs
+    $n = Next-Name $label
+    Snap $n; $shot[$label] = 1
+    Add-Index $n $stage $cmd $D[$descKey]
+    "{0}`t-`t{1} ({2})" -f $n, $cmd, $label | Out-File -Append -Encoding utf8 $log
   }
   while (-not $p.HasExited) {
     Start-Sleep -Milliseconds 300
@@ -222,28 +283,34 @@ function Run-Phases([string]$cmd) {
     while ($seen -lt $lines.Count) {
       $f = $lines[$seen] -split '\|'; $seen++
       switch ($f[0]) {
-        "ROW" { if ($f.Count -ge 3 -and $f[2] -ne "SKIP") { Shot $f[1] } }
+        "STEP" { if ($f.Count -ge 4 -and $stepLabel.ContainsKey($f[1])) { Shot $stepLabel[$f[1]] $stepLabel[$f[1]] } }
+        "ROW"  { if ($f.Count -ge 3 -and $f[1] -eq "report") { Shot "step12_report" "step12_report" } }
         "PHASE" {
-          $ph = $(if ($f.Count -ge 2) { $f[1] } else { "" })
-          if ($prevPhase -eq "preflight" -and $ph -ne "preflight") { Shot "preflight" }
-          if ($ph -in @("done", "aborted") -and -not $done) {
+          $phase = $(if ($f.Count -ge 2) { $f[1] } else { "" })
+          if ($phase -eq "preflight-done") { Shot "run_preflight" "run_preflight" }
+          if ($phase -eq "serve") { $serveAt = Get-Date }
+          if ($phase -eq "soak") { $soakAt = Get-Date }
+          if ($phase -in @("done", "aborted") -and -not $done) {
             $done = $true
-            Start-Sleep -Seconds 4   # NPU 요약·단계별 경과·총 소요가 출력될 시간
-            Snap "TC3_run_done"
+            Shot "done" "done" 4000   # NPU 요약·단계별 경과·총 소요가 출력될 시간
             # live(tmux)는 Enter 를 기다린다 → 마지막 화면을 찍었으니 닫기 신호
             $null = Get-Vm "cd $KitDir && touch `"`$(cat evidence/.current_run)/.live_close`""
           }
-          $prevPhase = $ph
         }
       }
     }
+    if ($phase -eq "serve" -and $serveAt -and ((Get-Date) - $serveAt).TotalSeconds -ge 5) { Shot "serve_loading" "serve_loading" 0 }
+    if ($phase -eq "soak" -and $soakAt -and ((Get-Date) - $soakAt).TotalSeconds -ge $SoakEvery) {
+      $prog++; Shot ("soak_progress_{0}" -f $prog) "soak_progress" 0; $soakAt = Get-Date
+    }
   }
   $p.WaitForExit()
-  if (-not $done) { Snap "TC3_run_done" }
+  Start-Sleep -Milliseconds 800
+  Shot "start2_summary" "start2_summary" 0
   $script:SnapQuiet = $false
   try { if (-not $wp.HasExited) { $wp.Kill() } } catch { }
-  $miss = @($num.Keys | Where-Object { -not $shot.ContainsKey($_) } | Sort-Object { $num[$_] })
-  if ($miss.Count) { Write-Warning ("단계 캡처 없음: {0} (실패로 건너뛴 단계이거나 재생이 중단됨)" -f ($miss -join ', ')) }
+  $miss = @((@($stepLabel.Values) + @("step12_report", "done")) | Where-Object { -not $shot.ContainsKey($_) })
+  if ($miss.Count) { Write-Warning ("캡처 안 된 단계: {0} (실패로 건너뛴 단계이거나 재생이 중단됨)" -f ($miss -join ', ')) }
   "{0}`t{1}`t{2}" -f "TC3_run", $p.ExitCode, $cmd | Out-File -Append -Encoding utf8 $log
   return $p.ExitCode
 }
@@ -274,7 +341,7 @@ if ($Clone) {
   if ("$px" -ne "TC3_PROXY=$Proxy") { Write-Error "tc3.env 에 TC3_PROXY 를 설정하지 못함 ($KitDir/tc3.env 확인): $px"; exit 1 }
   Write-Host "tc3.env: $px" -ForegroundColor Cyan
 }
-$Results["TC3_step00_vm_and_kit"] = Step "TC3_step00_vm_and_kit" @("hostname; grep PRETTY_NAME /etc/os-release; uname -r", "git log -1 --oneline", "grep -E '^TC3_(BACKEND|MODEL_NAME|MODEL_DIR|ARTIFACT_DIR|DEVICES|SOAK_N|PORT)=' tc3.env")
+if ($Mode.Count -eq 0) { $Results["TC3_step00_vm_and_kit"] = Step "TC3_step00_vm_and_kit" @("hostname; grep PRETTY_NAME /etc/os-release; uname -r", "git log -1 --oneline", "grep -E '^TC3_(BACKEND|MODEL_NAME|MODEL_DIR|ARTIFACT_DIR|DEVICES|SOAK_N|PORT)=' tc3.env") }
 
 function Show-Summary([int]$code) {
   Write-Host ""
@@ -317,18 +384,50 @@ if ($Fetch) {
   if ($Results["TC3_step00d_fetch_model"] -ne 0) { Write-Error "fetch-model 실패 — 이후 단계 중단"; Show-Summary 1 }
 }
 if ($Mode.Count -gt 0) {
-  # ---------- 시험 당일 3단계: ① 사전준비 확인 → ② 시험 스크립트 재생 → ③ 결과 저장·확인 ----------
+  # ---------- 시험 당일 흐름을 시험 실행기(start.sh) 항목별로: 0 시험 환경 → ① ./start.sh 1 → ② ./start.sh 2 → ③ ./start.sh 3 + 결과 상세 ----------
   if ("prep" -in $Mode) {
-    $Results["TC3_prep_preflight"] = Step "TC3_prep_preflight" @("bin/tc3 preflight")
-    if ($Results["TC3_prep_preflight"] -ne 0) { Write-Error "사전준비 확인 실패 — 재생하지 않음 (prep_check.log 확인)"; Show-Summary 1 }
+    $null = Cap "env_vm" "0 시험 환경" @("hostname; grep PRETTY_NAME /etc/os-release; uname -r", "nproc; free -h | head -2; df -h ~ | tail -1")
+    $null = Cap "env_npu" "0 시험 환경" @("lspci -nn | grep -iE 'furiosa|1ed2'", "furiosa-smi info", "furiosa-smi status")
+    $null = Cap "env_sdk" "0 시험 환경" @("dpkg -l | grep -E '^ii +furiosa-(driver-rngd|smi) '",
+                                          '~/furiosa-venv/bin/python -c "from importlib.metadata import version as v; print(''furiosa-llm'', v(''furiosa-llm''))"',
+                                          "python3 --version")
+    $null = Cap "env_models" "0 시험 환경" @("grep -E '^TC3_(MODEL_DIR|ARTIFACT_DIR|HF_ARTIFACT_REVISION)=' tc3.env",
+                                             'ls -lh "$(grep ^TC3_MODEL_DIR= tc3.env | cut -d= -f2)"',
+                                             'ls -lh "$(grep ^TC3_ARTIFACT_DIR= tc3.env | cut -d= -f2)" | cut -c1-120',
+                                             'du -sh "$(grep ^TC3_MODEL_DIR= tc3.env | cut -d= -f2)" "$(grep ^TC3_ARTIFACT_DIR= tc3.env | cut -d= -f2)"')
+    $null = Cap "env_kit" "0 시험 환경" @("git log -1 --oneline", "grep -vE '^[[:space:]]*(#|$)' tc3.env | grep -v TOKEN")
+    $null = Cap "start_menu" "① 시험 실행기" @("printf 'q\n' | ./start.sh")
+    $rc = Cap "start1_preflight" "① ./start.sh 1" @("./start.sh 1")
+    if ($rc -ne 0) { Write-Error "사전준비 확인 실패 — 재생하지 않음 (prep_check.log 확인)"; Show-Summary 1 }
   }
   if ("run" -in $Mode) {
-    $Results["TC3_run"] = Run-Phases "bin/tc3 live"
+    $Results["TC3_run"] = Run-Phases "./start.sh 2"
   }
   if ("result" -in $Mode) {
-    $Results["TC3_result"] = Step "TC3_result" @("bin/tc3 result")
-    $Results["TC3_result_files"] = Step "TC3_result_files" @("bin/tc3 result --files")
-    $Results["TC3_result_zip"] = Step "TC3_result_zip" @("bin/tc3 result --zip")
+    $null = Cap "start3_result" "③ ./start.sh 3" @("./start.sh 3")
+    $run = Get-Vm "cat $KitDir/evidence/.current_run 2>/dev/null"
+    $rel = "evidence/" + ($run -split '/')[-1]
+    $null = Cap "result_md_1" "③ 결과 상세" @("sed -n '1,/^## E\./p' $rel/RESULT.md")
+    $null = Cap "result_md_2" "③ 결과 상세" @("sed -n '/^## E\./,/^## 단계별 결과/p' $rel/RESULT.md")
+    $null = Cap "result_md_3" "③ 결과 상세" @("sed -n '/^## 단계별 결과/,/^## 증빙 파일/p' $rel/RESULT.md")
+    $null = Cap "result_md_4" "③ 결과 상세" @("sed -n '/^## 증빙 파일/,`$p' $rel/RESULT.md")
+    $files = @(
+      [pscustomobject]@{ L = "files_prep_check";  F = "prep_check.log" },
+      [pscustomobject]@{ L = "files_env";         F = "step04_*" },
+      [pscustomobject]@{ L = "files_params";      F = "step05_model_params.log" },
+      [pscustomobject]@{ L = "files_serve_log";   F = "step06_serve_log.log" },
+      [pscustomobject]@{ L = "files_npu_status";  F = "step06_*status.log" },
+      [pscustomobject]@{ L = "files_models";      F = "step07_models.log" },
+      [pscustomobject]@{ L = "files_chat_ko";     F = "step08_chat_ko.log" },
+      [pscustomobject]@{ L = "files_chat_en";     F = "step09_chat_en.log" },
+      [pscustomobject]@{ L = "files_soak";        F = "step10_soak.log" },
+      [pscustomobject]@{ L = "files_stop";        F = "step11_*" },
+      [pscustomobject]@{ L = "files_npu_summary"; F = "npu_summary.txt" }
+    )
+    foreach ($it in $files) { $null = Cap $it.L "③ 결과 상세 (result --files)" @("bin/tc3 result --files --only '$($it.F)'") }
+    $null = Cap "evidence_ls" "③ 결과 상세" @("ls -l $rel")
+    $null = Cap "evidence_sha" "③ 결과 상세" @("(cd $rel && sha256sum -c SHA256SUMS | tail -n 12)", "(cd $rel && sha256sum -c --quiet SHA256SUMS) && echo 'SHA256SUMS: 모든 파일 해시 일치'")
+    $null = Cap "result_zip" "③ 결과 상세" @("bin/tc3 result --zip", "ls -lh $rel.zip")
   }
 } else {
   if (-not $NoPreflight) { $Results["TC3_step00b_preflight"] = Step "TC3_step00b_preflight" @("bin/tc3 preflight") }
@@ -358,6 +457,67 @@ if ($run) {
     $ScpArgs = @($SshArgs | ForEach-Object { if ($_ -ceq '-p') { '-P' } else { $_ } })   # scp 의 포트 옵션은 -P
     & scp -r -q -o BatchMode=yes -o ConnectTimeout=15 @ScpArgs "${Target}:$run" $dst
   }
+}
+
+
+# ---------- INDEX.md (시험절차서 작성용 캡처 목록) + 전달용 압축 ----------
+if ($script:Index.Count -gt 0) {
+  $runBase = $(if ($run) { ($run -split '/')[-1] } else { "" })
+  $ev = $(if ($runBase) { Join-Path $CapDir "evidence\$runBase" } else { "" })
+  $sum = $null; $npu = $null; $soakS = $null
+  if ($ev -and (Test-Path "$ev\summary.json")) { try { $sum = Get-Content "$ev\summary.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
+  if ($ev -and (Test-Path "$ev\npu_summary.json")) { try { $npu = Get-Content "$ev\npu_summary.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
+  if ($ev -and (Test-Path "$ev\soak_summary.json")) { try { $soakS = Get-Content "$ev\soak_summary.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
+  $kitRev = Get-Vm "cd $KitDir && git log -1 --oneline"
+  $md = New-Object System.Collections.Generic.List[string]
+  $md.Add("# TC3 시험 절차 화면 캡처 목록 — $Stamp")
+  $md.Add("")
+  $md.Add("시험절차서 작성용. 시험 실행기 ``./start.sh`` 의 항목 순서대로 실제 터미널 화면을 캡처했다.")
+  $md.Add("")
+  $md.Add("| 항목 | 내용 |")
+  $md.Add("|---|---|")
+  $md.Add("| 대상 | ``$hn`` (ssh $Target) |")
+  $md.Add("| 키트 | ``$kitRev`` |")
+  if ($runBase) { $md.Add("| 증빙 run | ``evidence/$runBase`` (이 폴더의 ``evidence/$runBase/`` 에 원본 전체) |") }
+  if ($sum) {
+    $md.Add("| 종합 판정 | **$($sum.overall)** — $((@($sum.criteria.PSObject.Properties) | ForEach-Object { "$($_.Name): $($_.Value)" }) -join ' · ') |")
+    if ($sum.total_params) { $md.Add("| 모델 | $($sum.model) — 파라미터 $('{0:N0}' -f [int64]$sum.total_params) |") }
+  }
+  if ($soakS) { $md.Add(("| 연속 요청 | {0}/{1} 성공 ({2}%), p50 {3:N3} s · p95 {4:N3} s · 최대 {5:N3} s |" -f $soakS.ok, $soakS.n, $soakS.success_pct, $soakS.p50, $soakS.p95, $soakS.max)) }
+  if ($npu) { $md.Add(("| NPU 점유(참고) | 평균 {0}% · 최대 {1}% · 메모리 최대 {2} / {3} GiB |" -f $npu.overall.util_avg, $npu.overall.util_max, $npu.overall.mem_max_gib, $npu.mem_total_gib)) }
+  $md.Add("")
+  $md.Add("## 시험 실행기 start.sh 의 명령")
+  $md.Add("")
+  $md.Add("| 메뉴 | 실행하는 명령 | 하는 일 |")
+  $md.Add("|---|---|---|")
+  $md.Add("| 1 사전준비 확인 | ``bin/tc3 preflight`` | 미리 준비한 버전·모델 파일·포트·디스크·시계·NPU 를 기대값/실제값 표로 확인, 결과를 ``prep_check.log/json`` 에 저장 |")
+  $md.Add("| 2 시험 스크립트 재생 | ``bin/tc3 live`` | 절차 4~12(env → model-size → serve → verify → soak → stop → report)를 한 번에 실행. 왼쪽 실시간 출력, 오른쪽 NPU 상태(1초), NPU 사용률 기록·그래프 |")
+  $md.Add("| 3 결과 보기 | ``bin/tc3 result && bin/tc3 result --files`` | ``RESULT.md``(판정 A~D, NPU 점유, 소크 통계, 단계별 결과·소요, 증빙 파일·해시) 생성·출력 후 주요 로그 출력 |")
+  $md.Add("")
+  $md.Add("## 캡처 ($($script:Index.Count)장)")
+  $md.Add("")
+  $md.Add("| # | 파일 | 단계 | 화면의 명령 | 화면 내용 |")
+  $md.Add("|---|---|---|---|---|")
+  foreach ($r in $script:Index) {
+    $c = ($r.Cmd -replace '\|', '\|'); if ($c.Length -gt 90) { $c = $c.Substring(0, 87) + "..." }
+    $md.Add("| $($r.Seq) | ``$($r.File)`` | $($r.Stage) | ``$c`` | $($r.Desc) |")
+  }
+  $md.Add("")
+  $md.Add("## 함께 전달하는 파일")
+  $md.Add("")
+  if ($runBase) {
+    $md.Add("- ``evidence/$runBase/RESULT.md`` — 결과 문서 (판정·NPU·소크·단계·증빙 파일 목록)")
+    $md.Add("- ``evidence/$runBase/npu_utilization.png`` — NPU 사용률·메모리 타임라인 그래프 (화면 캡처가 아닌 그래프 이미지)")
+    $md.Add("- ``evidence/$runBase/soak_answers.jsonl`` — 연속 요청 100건의 질문·응답 전문 (한국어 50·영어 50)")
+    $md.Add("- ``evidence/$runBase/`` — 단계별 로그(stepNN_*.log), prep_check, report.md, summary.json, SHA256SUMS 등 원본 전체")
+  }
+  $md.Add("- ``steps.tsv`` — 캡처 순서와 각 명령의 종료코드")
+  [IO.File]::WriteAllLines((Join-Path $CapDir "INDEX.md"), $md, (New-Object Text.UTF8Encoding($false)))
+  Get-ChildItem $CapDir -Filter ".phase_watch*" -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+  $zip = "$CapDir.zip"
+  try { Compress-Archive -Path (Join-Path $CapDir "*") -DestinationPath $zip -Force; Write-Host "전달용 압축: $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)" -ForegroundColor Cyan }
+  catch { Write-Warning "압축 실패: $($_.Exception.Message)" }
+  Write-Host "캡처 목록: $(Join-Path $CapDir 'INDEX.md') — $($script:Index.Count)장" -ForegroundColor Cyan
 }
 
 Write-Host ""
