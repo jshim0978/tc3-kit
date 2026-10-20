@@ -539,6 +539,8 @@ _step_no()    { case "$1" in env) echo 4 ;; model-size) echo 5 ;; serve) echo 6 
 _step_title() { case "$1" in env) echo "가속기·실행환경 확인" ;; model-size) echo "모델 파라미터 수 산출" ;; serve) echo "추론 서버 기동·NPU 적재" ;;
                   verify) echo "모델 목록·한국어/영어 추론" ;; soak) echo "연속 요청 ${TC3_SOAK_N}회" ;; stop) echo "서버 정지·원복" ;; report) echo "판정 보고서" ;; esac; }
 _phase() { echo "$1" > "$TC3_RUN_DIR/phase" 2>/dev/null || true; }
+# 캡처용: 단계가 끝난 화면을 TC3_PHASE_HOLD 초 유지 (tc3-capture-vm.ps1 이 넘김 — 화면의 명령은 그대로 bin/tc3 live)
+_hold() { [[ "${TC3_PHASE_HOLD:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && sleep "$TC3_PHASE_HOLD"; return 0; }
 # 단계의 최종 결과 (status.tsv 의 해당 절차 번호들 중 가장 나쁜 것) — 화면 끝줄·run_timing.tsv 에 사용
 _phase_result() {
   local nums
@@ -610,6 +612,7 @@ cmd_run() {
   if ! cmd_preflight; then
     fail "사전준비 확인 실패 — 시험 단계를 시작하지 않습니다 (evidence/$(basename "$TC3_RUN_DIR")/prep_check.log)"; return 2
   fi
+  _phase preflight-done; _hold
   unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY   # 시험 단계에는 프록시를 쓰지 않음
   trap '_run_abort' INT TERM
   [[ "$from" == report ]] || _monitor_start
@@ -631,9 +634,11 @@ cmd_run() {
     r=$?
     sec="$(awk -v a="$t0" -v b="$EPOCHREALTIME" 'BEGIN { printf "%.1f", b - a }')"
     res="$(_phase_result "$step")"; (( r != 0 )) && [[ "$res" != FAIL ]] && res="FAIL"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$step" "$(_step_no "$step")" "$s0" "$(now_iso)" "$sec" "$res" >> "$tf"
     if (( r == 0 )); then printf '   %s→ %s (%s s)%s\n' "$C_GREEN" "$res" "$sec" "$C_RESET"
     else printf '   %s→ %s (%s s)%s\n' "$C_RED" "$res" "$sec" "$C_RESET"; rc=1; [[ -z "$failed" ]] && failed="$step"; fi
+    # 끝줄을 찍은 뒤 기록 → 캡처 도구가 이 행을 보고 찍을 때 화면에 단계의 끝이 보인다
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$step" "$(_step_no "$step")" "$s0" "$(now_iso)" "$sec" "$res" >> "$tf"
+    _hold
   done
   _phase done
   trap - INT TERM

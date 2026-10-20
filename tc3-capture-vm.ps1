@@ -32,7 +32,9 @@ param(
   [string]$Proxy = "",
   # 시험 당일 3단계 캡처: prep (사전준비 확인) · run (시험 스크립트 재생, 단계 경계마다 자동 캡처) · result (결과 저장·확인)
   #   예: -Mode prep,run,result   (지정하면 절차 4~12 개별 단계 캡처 대신 이 흐름을 캡처)
-  [string[]]$Mode = @()
+  [string[]]$Mode = @(),
+  # -Mode run: 단계가 끝난 화면을 유지할 시간(초) — 그 사이에 단계별 캡처 (화면에는 표시되지 않음)
+  [double]$PhaseHold = 2.5
 )
 $ErrorActionPreference = "Continue"
 # powershell -File 로 실행하면 배열 인자가 "a,b" 한 문자열로 들어오므로 쉼표로 나눈다
@@ -64,16 +66,28 @@ public static class TC3VmWin {
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
 "@
 [TC3VmWin]::SetProcessDPIAware() | Out-Null
-$script:TermHwnd = [TC3VmWin]::GetForegroundWindow()
-$cls = New-Object System.Text.StringBuilder 256; [TC3VmWin]::GetClassName($script:TermHwnd, $cls, 256) | Out-Null
-if ($cls.ToString() -notin @("CASCADIA_HOSTING_WINDOW_CLASS", "ConsoleWindowClass")) {
-  Write-Warning "시작 시 전면 창이 터미널이 아닙니다 (class=$cls) — 단계마다 그 시점의 전면 창을 캡처합니다"
-  $script:TermHwnd = [IntPtr]::Zero
+# 캡처할 창 = 이 스크립트가 도는 터미널 창. 전면 창으로 고르면 사용자가 그 순간 다른 창(브라우저 등)을 쓰고 있을 때
+# 그 창이 찍힌다 (10/16 PowerPoint, 10/20 Chrome 오캡처). → 고유한 제목을 붙이고 그 제목의 창을 찾는다.
+function Get-WinClass([IntPtr]$h) { $sb = New-Object System.Text.StringBuilder 256; [TC3VmWin]::GetClassName($h, $sb, 256) | Out-Null; $sb.ToString() }
+$TermClasses = @("CASCADIA_HOSTING_WINDOW_CLASS", "ConsoleWindowClass")
+$WinTitle = "TC3 capture $Stamp"
+try { $Host.UI.RawUI.WindowTitle = $WinTitle } catch { }
+$script:TermHwnd = [IntPtr]::Zero
+for ($i = 0; $i -lt 40 -and $script:TermHwnd -eq [IntPtr]::Zero; $i++) {
+  $h = [TC3VmWin]::FindWindow($null, $WinTitle)
+  if ($h -ne [IntPtr]::Zero -and (Get-WinClass $h) -in $TermClasses) { $script:TermHwnd = $h } else { Start-Sleep -Milliseconds 250 }
 }
+if ($script:TermHwnd -eq [IntPtr]::Zero) {
+  $h = [TC3VmWin]::GetForegroundWindow()
+  if ((Get-WinClass $h) -in $TermClasses) { $script:TermHwnd = $h; Write-Warning "제목으로 창을 찾지 못해 전면 터미널 창을 캡처 대상으로 씁니다" }
+  else { Write-Error "캡처할 터미널 창을 찾지 못함 (제목 '$WinTitle') — Windows Terminal 의 '제목 표시줄에 터미널 제목 표시' 설정 확인"; exit 1 }
+}
+Write-Host ("캡처 대상 창: 0x{0:X} ({1})" -f $script:TermHwnd.ToInt64(), (Get-WinClass $script:TermHwnd)) -ForegroundColor DarkGray
 
 # 캡처 검사: 크기가 너무 작거나 화면이 밝으면(터미널이 아닌 창이 찍힌 경우 — 10/16 PowerPoint 오캡처) 경고 후 1회 다시 찍는다
 function Test-Snap([string]$path) {
@@ -102,7 +116,7 @@ function Snap([string]$name) {
   }
 }
 function Save-Snap([string]$name) {
-  Start-Sleep -Milliseconds 700
+  Start-Sleep -Milliseconds $(if ($script:SnapQuiet) { 200 } else { 700 })
   $h = $(if ($script:TermHwnd -ne [IntPtr]::Zero) { $script:TermHwnd } else { [TC3VmWin]::GetForegroundWindow() })
   if ([TC3VmWin]::IsIconic($h)) { Write-Warning "터미널 창이 최소화되어 있어 캡처가 비어 보일 수 있습니다" }
   $wr = New-Object TC3VmWin+RECT; [TC3VmWin]::GetWindowRect($h, [ref]$wr) | Out-Null
@@ -124,11 +138,13 @@ function Save-Snap([string]$name) {
 # ---------- VM 실행 ----------
 # 명령을 VM 의 bash 스크립트로 만들어 base64 로 보낸다 (PowerShell 5.1 의 인자 따옴표 문제 회피).
 # 스크립트는 VM 의 실제 프롬프트 형식(Ubuntu 기본 PS1 색)으로 "user@host:~/dir$ 명령" 을 찍고 명령을 실행한다.
-function Invoke-Vm([string[]]$commands, [string]$cwd = $KitDir, [switch]$Quiet, [switch]$NoWait) {
+function Invoke-Vm([string[]]$commands, [string]$cwd = $KitDir, [switch]$Quiet, [switch]$NoWait, [string[]]$Exports = @()) {
   # 주의: PowerShell 에서 , 가 + 보다 먼저 결합 → 첫 원소는 괄호로 감싸야 함
   $lines = @(('cd ' + $cwd + ' 2>/dev/null || cd ~'),
              'P="$(printf ''\033[01;32m%s@%s\033[00m:\033[01;34m%s\033[00m$ '' "$(id -un)" "$(hostname -s)" "$(dirs +0)")"',
              'rc=0')
+  # 화면에 찍지 않는 환경변수 (예: 캡처용 TC3_PHASE_HOLD) — 화면의 명령은 당일과 같게 둔다
+  foreach ($e in $Exports) { $lines += "export $e" }
   foreach ($c in $commands) {
     $q = $c.Replace("'", "'\''")
     if (-not $Quiet) { $lines += "printf '%s%s\n' `"`$P`" '$q'" }
@@ -141,7 +157,8 @@ function Invoke-Vm([string[]]$commands, [string]$cwd = $KitDir, [switch]$Quiet, 
   $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
   $remote = "f=`$(mktemp /tmp/tc3_capture.XXXXXX) && echo $b64 | base64 -d > `$f && bash `$f; r=`$?; rm -f `$f; exit `$r"
   # ssh 를 콘솔에 직접 연결해 실행 (출력을 변수로 받으면 화면에 아무것도 안 남음 → 캡처가 빈 창이 됨)
-  $argv = @("-t") + $SshArgs + @($Target, $remote) | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
+  # -q: 끝날 때 "Connection to ... closed." 같은 ssh 자체 메시지가 캡처에 찍히지 않게 (원격 명령의 출력·종료코드는 그대로)
+  $argv = @("-t", "-q") + $SshArgs + @($Target, $remote) | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
   $p = Start-Process -FilePath "ssh" -ArgumentList ($argv -join ' ') -NoNewWindow -PassThru
   $null = $p.Handle   # PS 5.1: 핸들을 잡아 두지 않으면 ExitCode 가 비는 문제
   if ($NoWait) { return $p }
@@ -188,12 +205,13 @@ function Run-Phases([string]$cmd) {
   $t0 = Get-Date; while (-not ((Test-Path $wout) -and (Get-Item $wout).Length -gt 0) -and ((Get-Date) - $t0).TotalSeconds -lt 20) { Start-Sleep -Milliseconds 200 }
   Clear-Host
   $script:SnapQuiet = $true
-  $p = Invoke-Vm @($cmd) -NoWait
+  # 재생이 단계 끝 화면을 잠시 유지하게 해서(TC3_PHASE_HOLD) 그 사이에 찍는다 — 다음 단계 출력이 섞이지 않음
+  $p = Invoke-Vm @($cmd) -NoWait -Exports @("TC3_PHASE_HOLD=$PhaseHold")
   $seen = 0; $prevPhase = ""; $done = $false; $shot = @{}
   $log = Join-Path $CapDir "steps.tsv"
   function Shot([string]$ph) {
     if (-not $num.ContainsKey($ph) -or $shot.ContainsKey($ph)) { return }
-    Start-Sleep -Milliseconds 600   # 다음 단계 머리줄까지 그려지도록
+    Start-Sleep -Milliseconds 300   # 단계 끝줄(→ PASS)이 그려지도록 — 재생은 TC3_PHASE_HOLD 동안 이 화면을 유지
     $n = "TC3_run_{0}_{1}" -f $num[$ph], $ph
     Snap $n; $shot[$ph] = 1
     "{0}`t-`t{1} (단계 {2} 끝)" -f $n, $cmd, $ph | Out-File -Append -Encoding utf8 $log
