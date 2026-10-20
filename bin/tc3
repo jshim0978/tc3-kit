@@ -3,12 +3,20 @@
 #
 #   bin/tc3 <command> [--backend furiosa|vllm|llamacpp|mock] [--env FILE] [--run DIR]
 #
-# 명령 (절차서 단계 번호와 대응):
+# 시험 당일 3단계 (./start.sh 1·2·3 과 같음):
+#   preflight     ① 사전준비 확인 — 버전·가중치·artifact·포트·디스크·시계를 표 한 장으로 (evidence/<run>/prep_check.log·json)
+#   live          ② 시험 스크립트 재생 — 왼쪽 run 실시간 출력, 오른쪽 NPU 상태 패널(1초) [tmux]. tmux 없으면 run --inline-monitor
+#   run           ② 재생 (한 화면): preflight → env → model-size → serve → verify → soak → stop → report, NPU 모니터·그래프
+#                    [--soak-n N] [--from <단계>] [--keep-going] [--inline-monitor] [--no-monitor]
+#   result        ③ 결과 저장·확인 — RESULT.md 생성 후 출력  [--files 주요 로그 출력] [--zip 제출용 압축]
+#
+# 사전준비(리허설) 명령:
 #   install       패키지/드라이버/이미지 설치·확인 (idempotent)
 #   hf-login      HF 로그인 (토큰 숨김 입력) + 원본 가중치 저장소 접근 확인 — gated 저장소용, fetch-model 전에
 #   fetch-model   모델 가중치·artifact 다운로드
 #   hf-logout     저장된 HF 토큰 삭제 (시험 후)
-#   preflight     시험 전 점검 (가속기·서버 실행파일·가중치·포트·파이썬 패키지) — 증빙에 기록하지 않음
+#
+# 개별 단계 (절차서 단계 번호와 대응):
 #   platform      [1~3] 플랫폼 증빙: openstack CLI 가 있으면 hypervisor/flavor/server 조회, 없으면 MANUAL
 #   env           [4]   가속기 PCI/드라이버/실행환경 확인
 #   model-size    [5]   모델 파라미터 수 산출 (safetensors)
@@ -33,12 +41,20 @@ usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' 
 CMD="${1:-}"; [[ -z "$CMD" || "$CMD" == "-h" || "$CMD" == "--help" ]] && usage 0
 shift
 ENV_FILE="$TC3_HOME/tc3.env"
+RUN_FROM=""; RUN_KEEP=""; RUN_MON="on"; RESULT_FILES=""; RESULT_ZIP=""
 while (( $# )); do
   case "$1" in
-    --backend|--env|--run) [[ $# -ge 2 && -n "$2" ]] || die "$1 다음에 값이 필요합니다" ;;&
+    --backend|--env|--run|--soak-n|--from) [[ $# -ge 2 && -n "$2" ]] || die "$1 다음에 값이 필요합니다" ;;&
     --backend) TC3_BACKEND="$2"; shift 2 ;;
     --env)     ENV_FILE="$2"; shift 2 ;;
     --run)     TC3_RUN_DIR="$2"; shift 2 ;;
+    --soak-n)  [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "--soak-n 은 1 이상의 정수"; TC3_SOAK_N="$2"; shift 2 ;;
+    --from)    RUN_FROM="$2"; shift 2 ;;
+    --keep-going)     RUN_KEEP=1; shift ;;
+    --inline-monitor) RUN_MON=inline; shift ;;
+    --no-monitor)     RUN_MON=off; shift ;;
+    --files) RESULT_FILES=1; shift ;;
+    --zip)   RESULT_ZIP=1; shift ;;
     -h|--help) usage 0 ;;
     *) die "알 수 없는 옵션: $1" ;;
   esac
@@ -102,6 +118,9 @@ BE="$TC3_HOME/lib/backend_${TC3_BACKEND}.sh"
 # 기본값: tc3 가 서버 프로세스를 직접 띄우고 내린다 (llamacpp 백엔드만 외부 서버 → 덮어씀)
 be_external_server() { return 1; }
 be_activate() { :; }
+# NPU 모니터 소스(tc3_npu_monitor.py --backend)와 live 오른쪽 패널 명령 — 가속기가 없는 로컬 백엔드는 CPU 로 흉내(SIMULATED)
+be_monitor_backend() { echo cpu; }
+be_live_panel_cmd() { echo "python3 '$TC3_HOME/scripts/tc3_npu_monitor.py' --backend cpu --once"; }
 # shellcheck disable=SC1090
 source "$BE"
 be_activate   # 예: furiosa venv — 모든 단계가 같은 python/furiosa-llm 을 쓰도록 한 번만 활성화
@@ -369,65 +388,119 @@ for r in rows:
 PYEOF
 }
 
-# 시험 전 점검: 증빙에는 기록하지 않고, 문제를 한눈에 보여준다. 치명 항목이 있으면 종료코드 1.
-PF_BAD=0; PF_WARN=0
-pf_ok()   { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
-pf_bad()  { printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$*"; PF_BAD=$((PF_BAD + 1)); }
-pf_warn() { printf '  %s!%s %s\n' "$C_YEL" "$C_RESET" "$*"; PF_WARN=$((PF_WARN + 1)); }
+# ---------- ① 사전준비 확인 (preflight) ----------
+# 미리 준비해 둔 것(버전·가중치·artifact·포트·디스크·시계…)을 표 한 장으로 보여주고, 같은 내용을
+# evidence/<run>/prep_check.log·prep_check.json 에 남긴다 (시험 단계 기록은 하지 않음). 문제(✗)가 있으면 종료코드 1.
+# 버전 고정과 다른 설치는 기본 주의(!) — 사전준비는 사용자 책임이므로. TC3_STRICT_VERSIONS=1 이면 문제(✗)로 막는다.
+PF_BAD=0; PF_WARN=0; PF_ROWS=()
+_pf_clean() { local s="${1//$'\t'/ }"; s="${s//$'\n'/ }"; s="${s//$'\x1f'/ }"; printf '%s' "${s//$'\r'/}"; }
+_pf_add() { # _pf_add <ok|bad|warn> <항목> <기대> <실제> [조치]
+  case "$1" in bad) PF_BAD=$((PF_BAD + 1)) ;; warn) PF_WARN=$((PF_WARN + 1)) ;; esac
+  PF_ROWS+=("$1"$'\x1f'"$(_pf_clean "$2")"$'\x1f'"$(_pf_clean "$3")"$'\x1f'"$(_pf_clean "$4")"$'\x1f'"$(_pf_clean "${5:-}")")
+}
+_pf_msg() { local r="$1" m="$2"; if [[ "$m" == *": "* ]]; then _pf_add "$r" "${m%%: *}" "" "${m#*: }"; else _pf_add "$r" "$m" "" ""; fi; }
+pf_ok()   { _pf_msg ok "$*"; }       # 한 줄 메시지 형식 (백엔드 점검이 사용) — "항목: 내용" 이면 항목/실제로 나눠 표에 넣는다
+pf_bad()  { _pf_msg bad "$*"; }
+pf_warn() { _pf_msg warn "$*"; }
+pf_row()  { _pf_add "$@"; }          # pf_row <ok|bad|warn> <항목> <기대> <실제> [조치]
+pf_ver()  { # pf_ver <항목> <기대> <실제> [조치]
+  if [[ "$2" == "$3" ]]; then _pf_add ok "$1" "$2" "$3"
+  elif [[ "${TC3_STRICT_VERSIONS:-0}" == 1 ]]; then _pf_add bad "$1" "$2" "$3" "${4:-} (TC3_STRICT_VERSIONS=1)"
+  else _pf_add warn "$1" "$2" "$3" "${4:-}기대와 다름 — 사전준비한 버전으로 진행 (막으려면 TC3_STRICT_VERSIONS=1)"; fi
+}
+_weights_desc() { # 가중치 요약: safetensors 개수·크기 (+ index 의 total_size)
+  python3 - "$1" <<'PYEOF'
+import glob, json, os, sys
+d = sys.argv[1]
+st = sorted(glob.glob(os.path.join(d, "*.safetensors")))
+msg = f"safetensors {len(st)}개 · {sum(os.path.getsize(f) for f in st) / 1e9:.2f} GB"
+try:
+    ts = json.load(open(os.path.join(d, "model.safetensors.index.json"), encoding="utf-8")).get("metadata", {}).get("total_size")
+    msg += f" (index {int(ts) / 1e9:.2f} GB)" if ts else ""
+except Exception:
+    pass
+print(msg)
+PYEOF
+}
+_dir_desc() { local n s; n="$(find "$1" -type f 2>/dev/null | wc -l)"; s="$(du -sb "$1" 2>/dev/null | cut -f1)"; awk -v n="$n" -v s="${s:-0}" 'BEGIN { printf "파일 %d개 · %.2f GB", n, s / 1e9 }'; }
 cmd_preflight() {
   use_proxy
-  log "preflight — $(be_describe)"
-  log "kit: $KIT_REV  host: $(hostname)  user: $(id -un)  time: $(now_iso)"
-  echo "  설정: backend=$TC3_BACKEND model=$TC3_MODEL_NAME port=$TC3_PORT api=$TC3_API_URL soak_n=$TC3_SOAK_N ready_timeout=${TC3_READY_TIMEOUT}s fixture=$TC3_FIXTURE"
+  evidence_fresh
+  PF_BAD=0; PF_WARN=0; PF_ROWS=()
+  # 키트·설정
   local dirty; dirty="$(git -C "$TC3_HOME" status --porcelain --untracked-files=no 2>/dev/null | wc -l)"
-  if [[ "$KIT_REV" == "-" ]]; then pf_warn "키트가 git 저장소가 아님 (커밋 확인 불가)"
-  elif (( dirty > 0 )); then pf_warn "키트에 커밋되지 않은 수정 ${dirty}개 (git status 확인)"
-  else pf_ok "키트 커밋 $KIT_REV (수정 없음)"; fi
-  [[ -x "$TC3_HOME/bin/tc3" ]] && pf_ok "bin/tc3 실행 권한" || pf_bad "bin/tc3 실행 권한 없음 → chmod +x bin/tc3"
-  [[ -f "$ENV_FILE" ]] && pf_ok "설정 파일: $ENV_FILE" || pf_warn "설정 파일 없음: $ENV_FILE (기본값 사용) → cp tc3.env.example tc3.env"
-  have curl && pf_ok "curl" || pf_bad "curl 없음"
-  if python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then pf_ok "python3 $(python3 -c 'import platform; print(platform.python_version())')"; else pf_bad "python3 >= 3.8 없음"; fi
-  if python3 -c 'import requests, safetensors, numpy' 2>/dev/null; then pf_ok "python 패키지 requests·safetensors·numpy"; else pf_bad "python 패키지 누락 → bin/tc3 install"; fi
-  have jq && pf_ok "jq" || pf_warn "jq 없음 (python 으로 대체 — 동작에는 문제 없음)"
+  if [[ "$KIT_REV" == "-" ]]; then pf_row warn "키트 커밋" "${TC3_EXPECTED_COMMIT:-git 커밋}" "git 저장소 아님" "커밋 확인 불가"
+  elif [[ -n "${TC3_EXPECTED_COMMIT:-}" ]]; then
+    local full; full="$(git -C "$TC3_HOME" rev-parse HEAD 2>/dev/null)"
+    if [[ "$full" == "$TC3_EXPECTED_COMMIT"* ]]; then pf_row ok "키트 커밋" "${TC3_EXPECTED_COMMIT:0:12}" "$KIT_REV"
+    else pf_ver "키트 커밋" "${TC3_EXPECTED_COMMIT:0:12}" "$KIT_REV" "절차서에 적은 커밋과 다름 → git checkout $TC3_EXPECTED_COMMIT. "; fi
+  else pf_row ok "키트 커밋" "커밋된 키트" "$KIT_REV"; fi
+  (( dirty > 0 )) && pf_row warn "키트 수정" "수정 없음" "커밋 안 된 수정 ${dirty}개" "git status 로 확인"
+  [[ -f "$ENV_FILE" ]] && pf_row ok "설정 파일" "tc3.env" "$ENV_FILE" || pf_row warn "설정 파일" "tc3.env" "없음 (기본값 사용)" "cp tc3.env.example tc3.env"
+  echo "  설정: backend=$TC3_BACKEND model=$TC3_MODEL_NAME port=$TC3_PORT soak_n=$TC3_SOAK_N ready_timeout=${TC3_READY_TIMEOUT}s fixture=$TC3_FIXTURE"
+  [[ -x "$TC3_HOME/bin/tc3" ]] && pf_row ok "실행 권한" "bin/tc3 실행 가능" "있음" || pf_row bad "실행 권한" "bin/tc3 실행 가능" "없음" "chmod +x bin/tc3"
+  # 실행 환경
+  local pyv; pyv="$(python3 -c 'import platform; print(platform.python_version())' 2>/dev/null)"
+  if python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then pf_row ok "python3" "≥ 3.8" "$pyv"; else pf_row bad "python3" "≥ 3.8" "${pyv:-없음}"; fi
+  local miss; miss="$(for m in requests safetensors numpy; do python3 -c "import $m" 2>/dev/null || printf '%s ' "$m"; done)"
+  if [[ -z "$miss" ]]; then pf_row ok "파이썬 패키지" "requests·safetensors·numpy" "모두 있음"; else pf_row bad "파이썬 패키지" "requests·safetensors·numpy" "없음: $miss" "bin/tc3 install (사전준비)"; fi
+  if python3 -c 'import matplotlib' 2>/dev/null; then pf_row ok "matplotlib (NPU 그래프)" "있음" "$(python3 -c 'import matplotlib; print(matplotlib.__version__)')"
+  else pf_row warn "matplotlib (NPU 그래프)" "있음" "없음" "그래프는 ASCII 로 대체 — 사전준비에서 python3 -m pip install matplotlib"; fi
+  have curl && pf_row ok "curl" "있음" "$(curl --version | head -1 | cut -d' ' -f1-2)" || pf_row bad "curl" "있음" "없음"
+  have jq || pf_row warn "jq" "있음" "없음" "python 으로 대체 — 동작에는 문제 없음"
+  if have tmux; then pf_row ok "tmux (live 화면)" "있음" "$(tmux -V)"; else pf_row warn "tmux (live 화면)" "있음" "없음" "bin/tc3 live 는 run --inline-monitor 로 대체 — 사전준비에서 sudo apt-get install -y tmux"; fi
+  # 증빙
   local root; root="$(evidence_root)"
-  if mkdir -p "$root" 2>/dev/null && [[ -w "$root" ]]; then
-    local free_kb; free_kb="$(df -Pk "$root" 2>/dev/null | awk 'NR == 2 { print $4 }')"
-    if [[ -n "$free_kb" ]] && (( free_kb < 1048576 )); then pf_warn "증빙 디스크 여유 $((free_kb / 1024)) MB (< 1 GB)"; else pf_ok "증빙 디렉터리 쓰기 가능: $root"; fi
-  else pf_bad "증빙 디렉터리 쓰기 불가: $root"; fi
-  if [[ -f "$root/.current_run" ]]; then
-    local base; base="$(basename "$(cat "$root/.current_run")")"
-    if [[ "$base" == "$(date +%Y%m%d)-"* && "$base" == *"-$TC3_BACKEND" ]]; then pf_warn "오늘 run 이 이미 있음 → 이어서 기록됨: evidence/$base (새 run 을 원하면 rm evidence/.current_run)"
-    else pf_ok "다음 단계는 새 run 으로 기록됨 (이전: $base)"; fi
-  else pf_ok "다음 단계는 새 run 으로 기록됨"; fi
-  if [[ "$TC3_FIXTURE" == "1" ]]; then pf_warn "TC3_FIXTURE=1 — 합성 fixture 로 파라미터 수 산출 (시험 당일은 0)"
+  local free_kb; free_kb="$(df -Pk "$root" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+  if [[ -w "$TC3_RUN_DIR" ]]; then
+    if [[ -n "$free_kb" ]] && (( free_kb < 1048576 )); then pf_row warn "증빙 디스크" "여유 ≥ 1 GB" "$((free_kb / 1024)) MB"
+    else pf_row ok "증빙 디스크" "여유 ≥ 1 GB" "$(awk -v k="${free_kb:-0}" 'BEGIN { printf "%.1f GB", k / 1048576 }')"; fi
+  else pf_row bad "증빙 디렉터리" "쓰기 가능" "쓰기 불가: $root"; fi
+  pf_row ok "증빙 run" "evidence/<날짜-시각>-$TC3_BACKEND" "evidence/$(basename "$TC3_RUN_DIR")"
+  # 모델
+  if [[ "$TC3_FIXTURE" == "1" ]]; then pf_row warn "원본 가중치" "실제 가중치" "TC3_FIXTURE=1 (합성 fixture)" "시험 당일은 TC3_FIXTURE=0"
   else
-    local wc; if wc="$(check_weights "$TC3_MODEL_DIR" 2>&1)"; then pf_ok "원본 가중치 완전: $TC3_MODEL_DIR"
+    local wc; if wc="$(check_weights "$TC3_MODEL_DIR" 2>&1)"; then pf_row ok "원본 가중치" "config + safetensors 완전" "$(_weights_desc "$TC3_MODEL_DIR") — $TC3_MODEL_DIR"
     else
-      pf_bad "원본 가중치 문제: ${wc##*$'\n'} → bin/tc3 fetch-model"
+      pf_row bad "원본 가중치" "config + safetensors 완전" "원본 가중치 문제: ${wc##*$'\n'} ($TC3_MODEL_DIR)" "사전준비: bin/tc3 fetch-model"
       local hu; hu="$(_hf_whoami)"
-      if [[ -n "$hu" ]]; then pf_ok "HF 로그인: $hu (fetch-model 가능)"; else pf_warn "HF 미로그인 — gated 저장소면 bin/tc3 hf-login 후 fetch-model"; fi
+      if [[ -n "$hu" ]]; then pf_row ok "HF 로그인" "로그인" "$hu (fetch-model 가능)"; else pf_row warn "HF 로그인" "로그인" "안 됨" "gated 저장소면 bin/tc3 hf-login 후 fetch-model"; fi
     fi
   fi
+  # 포트·서버
   if ! be_external_server; then
-    if server_alive; then pf_warn "tc3 가 띄운 서버 실행 중 (pid $(server_pid)) — serve 시 자동 재기동, 정리: bin/tc3 stop"
-    elif port_in_use "$TC3_PORT"; then pf_bad "포트 $TC3_PORT 을 다른 프로세스가 사용 중 → $(port_owner_cmd "$TC3_PORT")"
-    else pf_ok "포트 $TC3_PORT 비어 있음"; fi
+    if server_alive; then pf_row warn "포트 $TC3_PORT" "비어 있음" "tc3 서버 실행 중 (pid $(server_pid))" "serve 시 자동 재기동, 정리: bin/tc3 stop"
+    elif port_in_use "$TC3_PORT"; then pf_row bad "포트 $TC3_PORT" "비어 있음" "다른 프로세스가 사용 중" "포트 $TC3_PORT 사용 프로세스 정리: $(port_owner_cmd "$TC3_PORT")"
+    else pf_row ok "포트 $TC3_PORT" "비어 있음" "비어 있음"; fi
   fi
+  # 네트워크 (프록시를 쓰는 리허설 환경만)
   if [[ -n "${TC3_PROXY:-}" ]]; then
     local hc; hc="$(curl -s -o /dev/null -m 15 -w '%{http_code}' https://huggingface.co 2>/dev/null)"
-    if [[ "$hc" =~ ^(2|3) ]]; then pf_ok "TC3_PROXY=$TC3_PROXY 경유 외부 접속 정상 (huggingface.co → $hc)"
+    if [[ "$hc" =~ ^(2|3) ]]; then pf_row ok "프록시 경유 외부 접속" "huggingface.co 응답" "정상 ($hc, TC3_PROXY=$TC3_PROXY)"
     elif check_weights "$TC3_MODEL_DIR" >/dev/null 2>&1 && [[ "$TC3_BACKEND" != furiosa || -n "$(ls -A "$TC3_ARTIFACT_DIR" 2>/dev/null)" ]]; then
-      # 받을 것을 이미 다 받았으면 serve 이후 단계에는 인터넷이 필요 없다
-      pf_warn "TC3_PROXY=$TC3_PROXY 경유 외부 접속 안 됨 (huggingface.co → ${hc:-연결 안 됨}) — 가중치·artifact 는 이미 있어 시험 단계에는 영향 없음"
-    else pf_bad "TC3_PROXY=$TC3_PROXY 경유 외부 접속 실패 (huggingface.co → ${hc:-연결 안 됨}) — master3 의 tc3-proxy 실행 확인"; fi
+      pf_row warn "프록시 경유 외부 접속" "huggingface.co 응답" "경유 외부 접속 안 됨 (${hc:-연결 안 됨})" "가중치·artifact 는 이미 있어 시험 단계에는 영향 없음"
+    else pf_row bad "프록시 경유 외부 접속" "huggingface.co 응답" "경유 외부 접속 실패 (${hc:-연결 안 됨}, TC3_PROXY=$TC3_PROXY)" "master3 의 tc3-proxy 실행 확인"; fi
   elif [[ -n "${http_proxy:-}${HTTP_PROXY:-}${https_proxy:-}${HTTPS_PROXY:-}" ]]; then
-    pf_ok "프록시 설정 감지 — 127.0.0.1/localhost 는 우회(no_proxy)"
+    pf_row ok "프록시 설정" "로컬 API 우회" "감지됨 — 127.0.0.1/localhost 는 no_proxy"
   fi
-  pf_ok "시각대: $(date '+%Z %z')"
+  # 시계
+  local ntp; ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+  case "$ntp" in
+    yes) pf_row ok "시각·동기화" "$TZ, NTP 동기화" "$(date '+%Y-%m-%d %H:%M:%S %Z') · 동기화됨" ;;
+    no)  pf_row warn "시각·동기화" "$TZ, NTP 동기화" "$(date '+%Y-%m-%d %H:%M:%S %Z') · 동기화 안 됨" "증빙 시각이 실제와 다를 수 있음 — timedatectl 확인" ;;
+    *)   pf_row ok "시각" "$TZ" "$(date '+%Y-%m-%d %H:%M:%S %Z')" ;;
+  esac
   declare -F be_preflight >/dev/null && be_preflight
+  # 표 출력 + 증빙 저장
+  local colorf=(); [[ -n "$C_RESET" ]] && colorf=(--color)
+  printf '%s\n' "${PF_ROWS[@]}" | python3 "$PY/tc3_prep_table.py" "${colorf[@]}" --title "사전준비 확인 — $(be_describe)" \
+    --meta "키트 $KIT_REV · 호스트 $(hostname) · 사용자 $(id -un) · $(now_iso)" \
+    --log "$TC3_RUN_DIR/prep_check.log" --json "$TC3_RUN_DIR/prep_check.json" \
+    --info "time=$(now_iso)" --info "host=$(hostname)" --info "user=$(id -un)" --info "kit=$KIT_REV" --info "backend=$TC3_BACKEND" \
+    || warn "사전준비 표 출력 실패 (python3) — 점검 결과: 문제 ${PF_BAD}건, 주의 ${PF_WARN}건"
   echo
-  if (( PF_BAD > 0 )); then fail "preflight: 문제 ${PF_BAD}건, 주의 ${PF_WARN}건 — 해결 후 시험 진행"; return 1; fi
-  ok "preflight: 문제 없음 (주의 ${PF_WARN}건)"
+  if (( PF_BAD > 0 )); then fail "preflight: 문제 ${PF_BAD}건, 주의 ${PF_WARN}건 — 해결 후 시험 진행 (evidence/$(basename "$TC3_RUN_DIR")/prep_check.log)"; return 1; fi
+  ok "preflight: 문제 없음 (주의 ${PF_WARN}건) — evidence/$(basename "$TC3_RUN_DIR")/prep_check.log"
 }
 
 cmd_all() {
@@ -448,6 +521,195 @@ cmd_all() {
   ok "모든 단계 완료 — $TC3_RUN_DIR"
 }
 
+
+# ---------- ② 시험 스크립트 재생 (run / live) ----------
+RUN_STEPS=(env model-size serve verify soak stop report)
+_step_no()    { case "$1" in env) echo 4 ;; model-size) echo 5 ;; serve) echo 6 ;; verify) echo "7~9" ;; soak) echo 10 ;; stop) echo 11 ;; report) echo 12 ;; *) echo - ;; esac; }
+_step_title() { case "$1" in env) echo "가속기·실행환경 확인" ;; model-size) echo "모델 파라미터 수 산출" ;; serve) echo "추론 서버 기동·NPU 적재" ;;
+                  verify) echo "모델 목록·한국어/영어 추론" ;; soak) echo "연속 요청 ${TC3_SOAK_N}회" ;; stop) echo "서버 정지·원복" ;; report) echo "판정 보고서" ;; esac; }
+_phase() { echo "$1" > "$TC3_RUN_DIR/phase" 2>/dev/null || true; }
+# 단계의 최종 결과 (status.tsv 의 해당 절차 번호들 중 가장 나쁜 것) — 화면 끝줄·run_timing.tsv 에 사용
+_phase_result() {
+  local nums
+  case "$1" in env) nums="04" ;; model-size) nums="05" ;; serve) nums="06" ;; verify) nums="07 08 09" ;; soak) nums="10" ;; stop) nums="11" ;;
+    report) json_get '.overall' < "$TC3_RUN_DIR/summary.json" 2>/dev/null || echo "-"; return ;; *) echo "-"; return ;; esac
+  awk -F'\t' -v n="$nums" 'BEGIN { split(n, a, " "); for (i in a) want[a[i]] = 1 }
+    ($1 in want) { seen++; if ($3 == "FAIL") f = 1; else if ($3 == "SIMULATED") s = 1; else if ($3 != "PASS") o = $3 }
+    END { if (!seen) print "-"; else if (f) print "FAIL"; else if (s) print "SIMULATED"; else if (o != "") print o; else print "PASS" }' "$TC3_RUN_DIR/status.tsv"
+}
+_hdr() { # _hdr <k> <n> <단계> <제목> — 캡처 도구는 '━━ [' 로 시작하는 줄을 단계 경계로 본다
+  local tag; if [[ "$3" == preflight ]]; then tag="[사전준비]"; else tag="[$1/$2] 절차 $(_step_no "$3") ·"; fi
+  echo
+  printf '%s━━ %s %s — %s · 시작 %s ━━%s\n' "$C_BOLD" "$tag" "$3" "$4" "$(date +%H:%M:%S)" "$C_RESET"
+}
+
+MON_PID=""; MON_BE=""
+_monitor_start() {
+  [[ "$RUN_MON" == off ]] && { log "NPU 모니터: 끔 (--no-monitor)"; return 0; }
+  MON_BE="$(be_monitor_backend)"
+  local args=(--backend "$MON_BE" --out "$TC3_RUN_DIR" --interval "${TC3_MONITOR_INTERVAL:-1}")
+  [[ "$RUN_MON" == inline ]] && args+=(--inline "${TC3_MONITOR_INLINE:-5}")
+  python3 "$PY/tc3_npu_monitor.py" "${args[@]}" 2>> "$TC3_RUN_DIR/npu_monitor.err" &
+  MON_PID=$!
+  log "NPU 모니터 시작 — ${MON_BE} ${TC3_MONITOR_INTERVAL:-1}s 간격 → npu_samples.csv$( [[ "$MON_BE" == cpu ]] && echo ' (가속기 없음: CPU 로 흉내, SIMULATED)')"
+}
+_monitor_stop() {
+  [[ -n "$MON_PID" ]] || return 0
+  if kill -0 "$MON_PID" 2>/dev/null; then
+    kill -TERM "$MON_PID" 2>/dev/null
+    local i; for i in $(seq 1 50); do kill -0 "$MON_PID" 2>/dev/null || break; sleep 0.1; done
+    kill -KILL "$MON_PID" 2>/dev/null || true
+  else
+    warn "NPU 모니터가 도중에 종료됨 — 시험 판정에는 영향 없음 (npu_monitor.err 확인)"
+  fi
+  wait "$MON_PID" 2>/dev/null; MON_PID=""
+  if [[ -f "$TC3_RUN_DIR/npu_samples.csv" ]] && (( $(wc -l < "$TC3_RUN_DIR/npu_samples.csv") > 1 )); then
+    echo
+    local simf=(); [[ "$MON_BE" == cpu ]] && simf=(--simulated)
+    python3 "$PY/tc3_npu_report.py" "$TC3_RUN_DIR" --backend "$MON_BE" "${simf[@]}" 2>> "$TC3_RUN_DIR/npu_monitor.err" \
+      || warn "NPU 요약 생성 실패 — npu_samples.csv 는 남아 있음 (npu_monitor.err)"
+  else
+    warn "NPU 샘플 없음 — 점유 그래프 생략 (npu_raw.log·npu_monitor.err 확인, 시험 판정과 무관)"
+  fi
+}
+_run_abort() {
+  trap - INT TERM
+  echo; warn "재생 중단 (Ctrl+C) — 서버를 정리하고 끝냅니다"
+  _phase aborted
+  cmd_stop || true
+  _monitor_stop
+  exit 130
+}
+
+cmd_run() {
+  local from="${RUN_FROM:-env}" start=-1 i n=${#RUN_STEPS[@]}
+  for i in "${!RUN_STEPS[@]}"; do [[ "${RUN_STEPS[$i]}" == "$from" ]] && start=$i; done
+  (( start >= 0 )) || die "--from 값은 ${RUN_STEPS[*]} 중 하나 (받은 값: $from)"
+  # 처음부터: 아직 시험 기록이 없는 오늘 run(사전준비 확인만 한 run)을 이어 쓰거나 새 run. --from: 현재 run 에서 이어서
+  if [[ "$from" == env ]]; then evidence_fresh; else evidence_resume; fi
+  local tf="$TC3_RUN_DIR/run_timing.tsv"
+  [[ -f "$tf" ]] || printf 'phase\tstep\tstart\tend\tseconds\tresult\n' > "$tf"
+  local first_row; first_row=$(( $(wc -l < "$tf") + 1 ))
+  banner
+  log "시험 스크립트 재생 — $(be_describe) · 연속 요청 ${TC3_SOAK_N}회$( [[ "$from" != env ]] && echo " · $from 부터 이어서")$( [[ -n "$RUN_KEEP" ]] && echo ' · 실패해도 계속')"
+  local t_run=$EPOCHREALTIME
+  _hdr 0 "$n" preflight "사전준비 확인"
+  _phase preflight
+  if ! cmd_preflight; then
+    fail "사전준비 확인 실패 — 시험 단계를 시작하지 않습니다 (evidence/$(basename "$TC3_RUN_DIR")/prep_check.log)"; return 2
+  fi
+  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY   # 시험 단계에는 프록시를 쓰지 않음
+  trap '_run_abort' INT TERM
+  [[ "$from" == report ]] || _monitor_start
+  local rc=0 failed="" step r res t0 sec s0
+  for (( i = start; i < n; i++ )); do
+    step="${RUN_STEPS[$i]}"
+    if [[ -n "$failed" && -z "$RUN_KEEP" && "$step" != stop && "$step" != report ]]; then
+      printf '%s\t%s\t-\t-\t-\tSKIP\n' "$step" "$(_step_no "$step")" >> "$tf"
+      warn "[절차 $(_step_no "$step")] $step 건너뜀 — 앞 단계($failed) 실패 (stop·report 는 수행)"
+      continue
+    fi
+    [[ "$step" == report ]] && _monitor_stop   # 점유 측정은 env~stop 구간 — 요약(E)이 report 에 들어가도록 report 전에 정리
+    _hdr $((i + 1)) "$n" "$step" "$(_step_title "$step")"
+    _phase "$step"; t0=$EPOCHREALTIME; s0="$(now_iso)"
+    case "$step" in
+      env) cmd_env ;; model-size) cmd_model_size ;; serve) cmd_serve ;; verify) cmd_verify ;;
+      soak) cmd_soak ;; stop) cmd_stop ;; report) cmd_report ;;
+    esac
+    r=$?
+    sec="$(awk -v a="$t0" -v b="$EPOCHREALTIME" 'BEGIN { printf "%.1f", b - a }')"
+    res="$(_phase_result "$step")"; (( r != 0 )) && [[ "$res" != FAIL ]] && res="FAIL"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$step" "$(_step_no "$step")" "$s0" "$(now_iso)" "$sec" "$res" >> "$tf"
+    if (( r == 0 )); then printf '   %s→ %s (%s s)%s\n' "$C_GREEN" "$res" "$sec" "$C_RESET"
+    else printf '   %s→ %s (%s s)%s\n' "$C_RED" "$res" "$sec" "$C_RESET"; rc=1; [[ -z "$failed" ]] && failed="$step"; fi
+  done
+  _phase done
+  trap - INT TERM
+  _monitor_stop
+  python3 "$PY/tc3_result.py" "$TC3_RUN_DIR" --backend "$TC3_BACKEND" --describe "$(be_describe)" --model "$TC3_MODEL_NAME" --kit-rev "$KIT_REV" --quiet \
+    || warn "RESULT.md 생성 실패 — bin/tc3 result 로 다시 생성"
+  # 단계별 경과
+  local total; total="$(awk -v a="$t_run" -v b="$EPOCHREALTIME" 'BEGIN { s = int(b - a); printf "%d분 %02d초", s / 60, s % 60 }')"
+  echo
+  log "단계별 경과 (evidence/$(basename "$TC3_RUN_DIR")/run_timing.tsv)"
+  tail -n "+$first_row" "$tf" | awk -F'\t' '{ printf "    절차 %-4s  %-11s  %-9s  %8s s\n", $2, $1, $6, $5 }'
+  echo "    총 소요 $total"
+  echo
+  if (( rc )); then fail "재생 결과: 실패 (첫 실패 단계: $failed) — 결과 확인: bin/tc3 result"; return 1; fi
+  ok "재생 완료 — 결과 저장·확인: bin/tc3 result"
+}
+
+# live: tmux 로 왼쪽 = run 실시간 출력, 오른쪽 = NPU 상태(1초 갱신). 명령은 임시 스크립트로 넘겨 따옴표 문제를 피한다.
+cmd_live() {
+  local why=""
+  have tmux || why="tmux 없음"
+  [[ -z "$why" && ! ( -t 0 && -t 1 ) ]] && why="터미널(tty)이 아님"
+  [[ -z "$why" && -n "${TMUX:-}" ]] && why="이미 tmux 안에서 실행 중"
+  if [[ -n "$why" ]]; then
+    warn "live: $why → run --inline-monitor 로 진행 (화면 중간에 NPU 상태 한 줄씩)"
+    [[ "$RUN_MON" == off ]] || RUN_MON=inline
+    cmd_run; return
+  fi
+  # 세션 이름 고정: SSH 가 끊겨도 재생은 tmux 안에서 계속된다 → 다시 접속해 bin/tc3 live 를 치면 새로 돌리지 않고 다시 붙는다
+  local sess="tc3-live"
+  if tmux has-session -t "$sess" 2>/dev/null; then
+    warn "live: 이미 재생 중인 화면이 있음 → 새로 시작하지 않고 다시 붙습니다 (tmux attach -t $sess)"
+    tmux -u attach-session -t "$sess"; return $?
+  fi
+  local d; d="$(mktemp -d)"
+  {
+    echo '#!/usr/bin/env bash'
+    local v; while IFS= read -r v; do printf 'export %s=%q\n' "$v" "${!v}"; done < <(compgen -e | grep -E '^(TC3_|HF_|STUB_|PATH$|VIRTUAL_ENV$|LANG$|LC_ALL$|TZ$|PYTHONUNBUFFERED$)')
+    echo 'case "${LC_ALL:-${LANG:-}}" in *UTF-8*|*utf8*) ;; *) export LANG=C.UTF-8 ;; esac   # 한글이 _ 로 보이지 않도록'
+    printf 'cd %q\n' "$PWD"
+    local runcmd=("$TC3_HOME/bin/tc3" run --env "$ENV_FILE" --backend "$TC3_BACKEND")
+    [[ -n "$RUN_FROM" ]] && runcmd+=(--from "$RUN_FROM")
+    [[ -n "$RUN_KEEP" ]] && runcmd+=(--keep-going)
+    [[ "$RUN_MON" == off ]] && runcmd+=(--no-monitor)
+    printf '%q ' "${runcmd[@]}"; echo
+    printf 'echo $? > %q\n' "$d/rc"
+    echo "printf '\\n[tc3] 재생 끝 — Enter 를 누르면 이 화면을 닫습니다 '"
+    # Enter 또는 <현재 run>/.live_close 파일(캡처 도구가 마지막 화면을 찍은 뒤 만든다)로 닫는다
+    printf 'while :; do if read -r -t 1 _; then break; elif [ $? -le 128 ]; then sleep 1; fi; c="$(cat %q 2>/dev/null)/.live_close"; [ -e "$c" ] && { rm -f "$c"; break; }; done\n' "$(evidence_root)/.current_run"
+    printf 'tmux kill-session -t %q\n' "$sess"
+  } > "$d/left.sh"
+  local panel; panel="$(be_live_panel_cmd)"
+  cat > "$d/right.sh" <<EOF
+#!/usr/bin/env bash
+export PATH=$(printf %q "$PATH")
+case "\${LC_ALL:-\${LANG:-}}" in *UTF-8*|*utf8*) ;; *) export LANG=C.UTF-8 ;; esac
+while :; do
+  out="\$( { echo "NPU 상태 \$(date +%H:%M:%S) — 1초마다 갱신"; echo; $panel; } 2>&1 )"
+  printf '\033[H\033[2J%s\n' "\$out"
+  sleep 1
+done
+EOF
+  local cols lines; cols="$(tput cols 2>/dev/null || echo 160)"; lines="$(tput lines 2>/dev/null || echo 50)"
+  if ! tmux -u new-session -d -s "$sess" -x "$cols" -y "$lines" "bash $d/left.sh"; then
+    warn "live: tmux 세션을 만들지 못함 → run --inline-monitor"; rm -rf "$d"; RUN_MON=inline; cmd_run; return
+  fi
+  tmux set-option -t "$sess" status off >/dev/null
+  # 오른쪽 패널: furiosa-smi status 표(63칸)가 줄바꿈 없이 들어가는 66칸 고정 (좁은 창이면 45 %)
+  local pw="${TC3_LIVE_PANEL_COLS:-66}"; (( cols - pw < 80 )) && pw="45%"
+  tmux split-window -h -l "$pw" -t "$sess" "bash $d/right.sh"
+  tmux select-pane -t "$sess:0.0"
+  tmux -u attach-session -t "$sess"
+  local rc; rc="$(cat "$d/rc" 2>/dev/null)"
+  tmux kill-session -t "$sess" 2>/dev/null || true
+  rm -rf "$d"
+  return "${rc:-1}"
+}
+
+# ---------- ③ 결과 저장·확인 ----------
+cmd_result() {
+  local root; root="$(evidence_root)"
+  [[ -n "${TC3_RUN_DIR:-}" ]] || TC3_RUN_DIR="$(cat "$root/.current_run" 2>/dev/null)"
+  [[ -n "$TC3_RUN_DIR" && -d "$TC3_RUN_DIR" ]] || die "결과를 만들 run 이 없습니다 — bin/tc3 run 먼저 (또는 --run <evidence/run>)"
+  export TC3_RUN_DIR
+  local mode=(); [[ -n "$RESULT_FILES" ]] && mode+=(--files); [[ -n "$RESULT_ZIP" ]] && mode+=(--zip)
+  python3 "$PY/tc3_result.py" "$TC3_RUN_DIR" --backend "$TC3_BACKEND" --describe "$(be_describe)" --model "$TC3_MODEL_NAME" --kit-rev "$KIT_REV" "${mode[@]}"
+}
+
 case "$CMD" in
   install) cmd_install ;;            fetch-model) cmd_fetch_model ;;
   hf-login) cmd_hf_login ;;          hf-logout) cmd_hf_logout ;;
@@ -457,5 +719,7 @@ case "$CMD" in
   soak) cmd_soak ;;                  stop) cmd_stop ;;
   report) cmd_report ;;              status) cmd_status ;;
   all) cmd_all ;;
+  run) cmd_run ;;                    live) cmd_live ;;
+  result) cmd_result ;;
   *) die "알 수 없는 명령: $CMD (bin/tc3 --help)" ;;
 esac

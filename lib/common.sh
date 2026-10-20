@@ -32,6 +32,19 @@ evidence_init() {
   echo "$TC3_RUN_DIR" > "$root/.current_run" || die "run 포인터 기록 실패: $root/.current_run"
   [[ -f "$TC3_RUN_DIR/status.tsv" ]] || printf 'step\tname\tresult\tnote\ttime\n' > "$TC3_RUN_DIR/status.tsv"
 }
+# 사전준비 확인·재생(run) 용: 오늘·같은 백엔드 run 중 아직 시험 단계 기록이 없는 것(사전준비 확인만 한 run)만 이어 쓰고, 아니면 새 run
+#   → 당일 preflight → run → result 가 한 run 디렉터리에 모이고, 이미 끝난 시험 run 에는 섞이지 않는다
+evidence_fresh() {
+  local root; root="$(evidence_root)"
+  if [[ -z "${TC3_RUN_DIR:-}" && -f "$root/.current_run" ]]; then
+    local prev base; prev="$(cat "$root/.current_run")"; base="$(basename "$prev")"
+    if [[ -d "$prev" && "$prev" == "$root/"* && "$base" == "$(date +%Y%m%d)-"* && "$base" == *"-$TC3_BACKEND" ]] \
+       && (( $(awk -F'\t' 'NR > 1 && $1 != ""' "$prev/status.tsv" 2>/dev/null | wc -l) == 0 )); then
+      TC3_RUN_DIR="$prev"; export TC3_RUN_DIR
+    fi
+  fi
+  evidence_init
+}
 evidence_resume() {
   # 개별 단계 실행 시: 오늘·같은 백엔드로 만든 최근 run 을 이어서 쓴다. 아니면 새 run.
   #  - 날짜가 다름(리허설 때 남은 run) / 백엔드가 다름(본선→예비 전환) / 다른 위치에서 복사된 포인터 → 새 run
@@ -244,7 +257,7 @@ py_deps_install() {
     pkg="${mod#*:}"; mod="${mod%%:*}"
     python3 -c "import $mod" 2>/dev/null || missing+=("$pkg")
   done
-  if (( ${#missing[@]} == 0 )); then ok "파이썬 패키지 이미 설치됨 (requests, safetensors, numpy, huggingface_hub) — 변경 없음"; return 0; fi
+  if (( ${#missing[@]} == 0 )); then ok "파이썬 패키지 이미 설치됨 (requests, safetensors, numpy, huggingface_hub) — 변경 없음"; py_optional_install; return 0; fi
   if ! python3 -m pip --version >/dev/null 2>&1; then
     warn "pip 가 없습니다 → python3-pip 설치"
     apt_get update && apt_get install python3-pip
@@ -254,6 +267,15 @@ py_deps_install() {
     || python3 -m pip install --quiet --break-system-packages "${missing[@]}"   # PEP 668 환경(24.04+)
   if python3 -c 'import requests, safetensors, numpy, huggingface_hub' 2>/dev/null; then ok "파이썬 패키지 확인 (requests, safetensors, numpy, huggingface_hub)"
   else fail "파이썬 패키지 설치 실패 — python3 -m pip install ${missing[*]}"; return 1; fi
+  py_optional_install
+}
+# 선택 패키지: matplotlib (run 의 NPU 점유 그래프). 실패해도 설치 전체를 실패로 만들지 않는다 (없으면 ASCII 그래프)
+py_optional_install() {
+  python3 -c 'import matplotlib' 2>/dev/null && return 0
+  log "선택 패키지 설치: matplotlib (NPU 점유 그래프)"
+  python3 -m pip install --quiet matplotlib 2>/dev/null || python3 -m pip install --quiet --break-system-packages matplotlib 2>/dev/null \
+    || warn "matplotlib 설치 실패 — NPU 그래프는 ASCII 로 대체 (시험 진행에는 영향 없음)"
+  return 0
 }
 
 # json_get <jq-filter> : stdin JSON 에서 값 추출 (jq 없으면 python 대체)

@@ -29,12 +29,17 @@ param(
   [switch]$NoPreflight,
   [switch]$NoFetch,
   # VM 에 인터넷이 없을 때: master3 의 tools/tc3-proxy.py 주소 (예: http://192.168.90.153:3128) — clone 과 tc3.env 의 TC3_PROXY 에 사용
-  [string]$Proxy = ""
+  [string]$Proxy = "",
+  # 시험 당일 3단계 캡처: prep (사전준비 확인) · run (시험 스크립트 재생, 단계 경계마다 자동 캡처) · result (결과 저장·확인)
+  #   예: -Mode prep,run,result   (지정하면 절차 4~12 개별 단계 캡처 대신 이 흐름을 캡처)
+  [string[]]$Mode = @()
 )
 $ErrorActionPreference = "Continue"
 # powershell -File 로 실행하면 배열 인자가 "a,b" 한 문자열로 들어오므로 쉼표로 나눈다
 $Steps   = @($Steps   | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $SshArgs = @($SshArgs | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+$Mode    = @($Mode    | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+foreach ($m in $Mode) { if ($m -notin @("prep", "run", "result")) { Write-Error "-Mode 값은 prep, run, result (받은 값: $m)"; exit 1 } }
 # 별도 ssh 설정 파일 (점프 호스트·포트·키를 담은 config) — powershell -File 로도 넘길 수 있는 단일 문자열 인자
 if ($SshConfig) { $SshArgs = @("-F", $SshConfig) + $SshArgs }
 if ($Proxy -and $Proxy -notmatch '^http://[A-Za-z0-9.-]+:[0-9]+$') { Write-Error "-Proxy 형식: http://<주소>:<포트> (예: http://192.168.90.153:3128) — 받은 값: $Proxy"; exit 1 }
@@ -70,7 +75,33 @@ if ($cls.ToString() -notin @("CASCADIA_HOSTING_WINDOW_CLASS", "ConsoleWindowClas
   $script:TermHwnd = [IntPtr]::Zero
 }
 
+# 캡처 검사: 크기가 너무 작거나 화면이 밝으면(터미널이 아닌 창이 찍힌 경우 — 10/16 PowerPoint 오캡처) 경고 후 1회 다시 찍는다
+function Test-Snap([string]$path) {
+  $b = New-Object System.Drawing.Bitmap $path
+  try {
+    if ($b.Width -lt 300 -or $b.Height -lt 200) { return "크기 $($b.Width)x$($b.Height) 가 너무 작음" }
+    $sum = 0.0; $n = 0
+    for ($x = 5; $x -lt $b.Width; $x += [Math]::Max(1, [int]($b.Width / 40))) {
+      for ($y = 5; $y -lt $b.Height; $y += [Math]::Max(1, [int]($b.Height / 40))) { $c = $b.GetPixel($x, $y); $sum += (0.299 * $c.R + 0.587 * $c.G + 0.114 * $c.B) / 255; $n++ }
+    }
+    if ($n -gt 0 -and ($sum / $n) -gt 0.55) { return ("밝기 {0:N2} — 어두운 터미널 화면이 아님" -f ($sum / $n)) }
+    return ""
+  } finally { $b.Dispose() }
+}
 function Snap([string]$name) {
+  Save-Snap $name
+  $p = Join-Path $CapDir "$name.png"
+  $why = Test-Snap $p
+  if ($why) {
+    if (-not $script:SnapQuiet) { Write-Warning "캡처 확인 필요 ($name): $why → 1초 후 다시 캡처" }
+    Start-Sleep -Seconds 1; Save-Snap $name; $why = Test-Snap $p
+    if ($why) {
+      if (-not $script:SnapQuiet) { Write-Warning "다시 찍어도 확인 필요 ($name): $why" }
+      "{0}`tCHECK`t{1}" -f $name, $why | Out-File -Append -Encoding utf8 (Join-Path $CapDir "steps.tsv")
+    }
+  }
+}
+function Save-Snap([string]$name) {
   Start-Sleep -Milliseconds 700
   $h = $(if ($script:TermHwnd -ne [IntPtr]::Zero) { $script:TermHwnd } else { [TC3VmWin]::GetForegroundWindow() })
   if ([TC3VmWin]::IsIconic($h)) { Write-Warning "터미널 창이 최소화되어 있어 캡처가 비어 보일 수 있습니다" }
@@ -86,13 +117,14 @@ function Snap([string]$name) {
   if ($ok) { $bmp = $full.Clone((New-Object System.Drawing.Rectangle ($r.L - $wr.L), ($r.T - $wr.T), $w, $hh), $full.PixelFormat) }
   else { $bmp = New-Object System.Drawing.Bitmap $w, $hh; $g2 = [System.Drawing.Graphics]::FromImage($bmp); $g2.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size); $g2.Dispose() }
   $bmp.Save($p, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose(); $full.Dispose()
-  Write-Host "  [capture] $p" -ForegroundColor DarkGray
+  # 재생(tmux) 화면 위에 글자를 찍으면 다음 캡처에 섞이므로, 재생 중에는 화면에 쓰지 않는다
+  if (-not $script:SnapQuiet) { Write-Host "  [capture] $p" -ForegroundColor DarkGray }
 }
 
 # ---------- VM 실행 ----------
 # 명령을 VM 의 bash 스크립트로 만들어 base64 로 보낸다 (PowerShell 5.1 의 인자 따옴표 문제 회피).
 # 스크립트는 VM 의 실제 프롬프트 형식(Ubuntu 기본 PS1 색)으로 "user@host:~/dir$ 명령" 을 찍고 명령을 실행한다.
-function Invoke-Vm([string[]]$commands, [string]$cwd = $KitDir, [switch]$Quiet) {
+function Invoke-Vm([string[]]$commands, [string]$cwd = $KitDir, [switch]$Quiet, [switch]$NoWait) {
   # 주의: PowerShell 에서 , 가 + 보다 먼저 결합 → 첫 원소는 괄호로 감싸야 함
   $lines = @(('cd ' + $cwd + ' 2>/dev/null || cd ~'),
              'P="$(printf ''\033[01;32m%s@%s\033[00m:\033[01;34m%s\033[00m$ '' "$(id -un)" "$(hostname -s)" "$(dirs +0)")"',
@@ -112,6 +144,7 @@ function Invoke-Vm([string[]]$commands, [string]$cwd = $KitDir, [switch]$Quiet) 
   $argv = @("-t") + $SshArgs + @($Target, $remote) | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
   $p = Start-Process -FilePath "ssh" -ArgumentList ($argv -join ' ') -NoNewWindow -PassThru
   $null = $p.Handle   # PS 5.1: 핸들을 잡아 두지 않으면 ExitCode 가 비는 문제
+  if ($NoWait) { return $p }
   $p.WaitForExit()
   return $p.ExitCode
 }
@@ -125,6 +158,76 @@ function Step([string]$name, [string[]]$commands, [string]$cwd = $KitDir) {
   Snap $name
   "{0}`t{1}`t{2}" -f $name, $rc, ($commands -join " ; ") | Out-File -Append -Encoding utf8 (Join-Path $CapDir "steps.tsv")
   return $rc
+}
+
+# 시험 스크립트 재생 캡처: 재생을 띄워 둔 채, VM 의 <현재 run>/phase 변화를 SSH 한 연결로 지켜보다가
+# 단계가 바뀔 때마다(=앞 단계 출력이 끝난 화면) TC3_run_NN_<단계>.png, 끝나면 TC3_run_done.png 를 찍는다.
+function Run-Phases([string]$cmd) {
+  $num = @{ "preflight" = "00"; "env" = "04"; "model-size" = "05"; "serve" = "06"; "verify" = "07-09"; "soak" = "10"; "stop" = "11"; "report" = "12" }
+  # VM 쪽 감시: 끝난 단계는 run_timing.tsv 의 새 행으로(빠른 단계도 놓치지 않음), 현재 단계는 phase 파일로 알린다
+  $watch = @(('cd ' + $KitDir + ' 2>/dev/null || exit 1'), 'run=""; rows=0; last=""; first=1',
+             'while :; do',
+             '  r="$(cat evidence/.current_run 2>/dev/null)"; f="$r/run_timing.tsv"',
+             '  if [ "$r" != "$run" ]; then',
+             '    if [ $first = 1 ]; then rows=$(cat "$f" 2>/dev/null | wc -l); first=0; else rows=0; fi',
+             '    run="$r"; echo "BASE|$r|$rows"',
+             '  fi',
+             '  new="$(tail -n +$((rows + 1)) "$f" 2>/dev/null)"',
+             '  if [ -n "$new" ]; then',
+             '    printf "%s\n" "$new" | awk -F "\t" ''NF >= 6 && $1 != "phase" { print "ROW|" $1 "|" $6 }''',
+             '    rows=$((rows + $(printf "%s\n" "$new" | wc -l)))',
+             '  fi',
+             '  p="$(cat "$r/phase" 2>/dev/null)"; if [ "$p" != "$last" ]; then echo "PHASE|$p"; last="$p"; fi',
+             '  sleep 0.3',
+             'done') -join "`n"
+  $wb64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($watch + "`n"))
+  $wout = Join-Path $CapDir ".phase_watch.txt"; $werr = Join-Path $CapDir ".phase_watch.err"
+  $wargs = ($NonInteractive + $SshArgs + @($Target, "echo $wb64 | base64 -d | bash")) | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
+  $wp = Start-Process -FilePath "ssh" -ArgumentList ($wargs -join ' ') -NoNewWindow -PassThru -RedirectStandardOutput $wout -RedirectStandardError $werr
+  # 감시가 기준선(BASE)을 보낸 뒤에 재생을 시작한다
+  $t0 = Get-Date; while (-not ((Test-Path $wout) -and (Get-Item $wout).Length -gt 0) -and ((Get-Date) - $t0).TotalSeconds -lt 20) { Start-Sleep -Milliseconds 200 }
+  Clear-Host
+  $script:SnapQuiet = $true
+  $p = Invoke-Vm @($cmd) -NoWait
+  $seen = 0; $prevPhase = ""; $done = $false; $shot = @{}
+  $log = Join-Path $CapDir "steps.tsv"
+  function Shot([string]$ph) {
+    if (-not $num.ContainsKey($ph) -or $shot.ContainsKey($ph)) { return }
+    Start-Sleep -Milliseconds 600   # 다음 단계 머리줄까지 그려지도록
+    $n = "TC3_run_{0}_{1}" -f $num[$ph], $ph
+    Snap $n; $shot[$ph] = 1
+    "{0}`t-`t{1} (단계 {2} 끝)" -f $n, $cmd, $ph | Out-File -Append -Encoding utf8 $log
+  }
+  while (-not $p.HasExited) {
+    Start-Sleep -Milliseconds 300
+    $lines = @(Get-Content $wout -Encoding UTF8 -ErrorAction SilentlyContinue)
+    while ($seen -lt $lines.Count) {
+      $f = $lines[$seen] -split '\|'; $seen++
+      switch ($f[0]) {
+        "ROW" { if ($f.Count -ge 3 -and $f[2] -ne "SKIP") { Shot $f[1] } }
+        "PHASE" {
+          $ph = $(if ($f.Count -ge 2) { $f[1] } else { "" })
+          if ($prevPhase -eq "preflight" -and $ph -ne "preflight") { Shot "preflight" }
+          if ($ph -in @("done", "aborted") -and -not $done) {
+            $done = $true
+            Start-Sleep -Seconds 4   # NPU 요약·단계별 경과·총 소요가 출력될 시간
+            Snap "TC3_run_done"
+            # live(tmux)는 Enter 를 기다린다 → 마지막 화면을 찍었으니 닫기 신호
+            $null = Get-Vm "cd $KitDir && touch `"`$(cat evidence/.current_run)/.live_close`""
+          }
+          $prevPhase = $ph
+        }
+      }
+    }
+  }
+  $p.WaitForExit()
+  if (-not $done) { Snap "TC3_run_done" }
+  $script:SnapQuiet = $false
+  try { if (-not $wp.HasExited) { $wp.Kill() } } catch { }
+  $miss = @($num.Keys | Where-Object { -not $shot.ContainsKey($_) } | Sort-Object { $num[$_] })
+  if ($miss.Count) { Write-Warning ("단계 캡처 없음: {0} (실패로 건너뛴 단계이거나 재생이 중단됨)" -f ($miss -join ', ')) }
+  "{0}`t{1}`t{2}" -f "TC3_run", $p.ExitCode, $cmd | Out-File -Append -Encoding utf8 $log
+  return $p.ExitCode
 }
 
 # ---------- 0) 접속·키트 ----------
@@ -195,25 +298,42 @@ if ($Fetch) {
   $Results["TC3_step00d_fetch_model"] = Step "TC3_step00d_fetch_model" @("bin/tc3 fetch-model")
   if ($Results["TC3_step00d_fetch_model"] -ne 0) { Write-Error "fetch-model 실패 — 이후 단계 중단"; Show-Summary 1 }
 }
-if (-not $NoPreflight) { $Results["TC3_step00b_preflight"] = Step "TC3_step00b_preflight" @("bin/tc3 preflight") }
-
-# ---------- 1) 절차 4~12 ----------
-$names = @{ "env" = "TC3_step04_env"; "model-size" = "TC3_step05_model_size"; "serve" = "TC3_step06_serve"; "verify" = "TC3_step07-09_verify";
-            "soak" = "TC3_step10_soak"; "stop" = "TC3_step11_stop"; "report" = "TC3_step12_report" }
-$serveFailed = $false
-foreach ($s in $Steps) {
-  $n = $(if ($names.ContainsKey($s)) { $names[$s] } else { "TC3_step_" + $s })
-  if ($serveFailed -and $s -in @("verify", "soak")) { Write-Warning "serve 실패 → $s 생략"; $Results[$n] = "skip"; continue }
-  $Results[$n] = Step $n @("bin/tc3 $s")
-  if ($s -eq "serve" -and $Results[$n] -ne 0) { $serveFailed = $true }
+if ($Mode.Count -gt 0) {
+  # ---------- 시험 당일 3단계: ① 사전준비 확인 → ② 시험 스크립트 재생 → ③ 결과 저장·확인 ----------
+  if ("prep" -in $Mode) {
+    $Results["TC3_prep_preflight"] = Step "TC3_prep_preflight" @("bin/tc3 preflight")
+    if ($Results["TC3_prep_preflight"] -ne 0) { Write-Error "사전준비 확인 실패 — 재생하지 않음 (prep_check.log 확인)"; Show-Summary 1 }
+  }
+  if ("run" -in $Mode) {
+    $Results["TC3_run"] = Run-Phases "bin/tc3 live"
+  }
+  if ("result" -in $Mode) {
+    $Results["TC3_result"] = Step "TC3_result" @("bin/tc3 result")
+    $Results["TC3_result_files"] = Step "TC3_result_files" @("bin/tc3 result --files")
+    $Results["TC3_result_zip"] = Step "TC3_result_zip" @("bin/tc3 result --zip")
+  }
+} else {
+  if (-not $NoPreflight) { $Results["TC3_step00b_preflight"] = Step "TC3_step00b_preflight" @("bin/tc3 preflight") }
+  # ---------- 1) 절차 4~12 (개별 단계) ----------
+  $names = @{ "env" = "TC3_step04_env"; "model-size" = "TC3_step05_model_size"; "serve" = "TC3_step06_serve"; "verify" = "TC3_step07-09_verify";
+              "soak" = "TC3_step10_soak"; "stop" = "TC3_step11_stop"; "report" = "TC3_step12_report" }
+  $serveFailed = $false
+  foreach ($s in $Steps) {
+    $n = $(if ($names.ContainsKey($s)) { $names[$s] } else { "TC3_step_" + $s })
+    if ($serveFailed -and $s -in @("verify", "soak")) { Write-Warning "serve 실패 → $s 생략"; $Results[$n] = "skip"; continue }
+    $Results[$n] = Step $n @("bin/tc3 $s")
+    if ($s -eq "serve" -and $Results[$n] -ne 0) { $serveFailed = $true }
+  }
 }
 
-# report.md 전체 + 증빙 목록 + status
+# report.md 전체 + 증빙 목록 + status (개별 단계 모드) · 증빙 가져오기 (공통)
 $run = Get-Vm "cat $KitDir/evidence/.current_run 2>/dev/null"
 if ($run) {
   $rel = "evidence/" + ($run -split '/')[-1]
-  $Results["TC3_step12_report_md"] = Step "TC3_step12_report_md" @("cat $rel/report.md")
-  $Results["TC3_step12b_evidence"] = Step "TC3_step12b_evidence" @("ls -l $rel", "bin/tc3 status")
+  if ($Mode.Count -eq 0) {
+    $Results["TC3_step12_report_md"] = Step "TC3_step12_report_md" @("cat $rel/report.md")
+    $Results["TC3_step12b_evidence"] = Step "TC3_step12b_evidence" @("ls -l $rel", "bin/tc3 status")
+  }
   if (-not $NoFetch) {
     $dst = Join-Path $CapDir "evidence"; New-Item -ItemType Directory -Force -Path $dst | Out-Null
     Write-Host "증빙 가져오기: scp -r ${Target}:$run $dst" -ForegroundColor Cyan

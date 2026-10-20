@@ -145,6 +145,28 @@ lines.append("")
 if soak:
     lines.append(f"연속 요청: success {soak.get('success','-')}, p50 {soak.get('p50','-')} s, p95 {soak.get('p95','-')} s, max {soak.get('max','-')} s")
     lines.append("")
+# E. NPU 점유 (bin/tc3 run 의 모니터가 남긴 요약) — 참고 증빙, 판정에는 쓰지 않음
+npu = None
+_ns = os.path.join(a.run_dir, "npu_summary.json")
+if os.path.exists(_ns):
+    try:
+        npu = json.load(open(_ns, encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        npu = None
+if npu:
+    def _v(x, unit=""):
+        return "-" if x is None else f"{x}{unit}"
+    o = npu.get("overall", {})
+    lines.append("## E. NPU 점유 (참고 — 판정 기준 아님)")
+    lines.append("")
+    lines.append(f"장치 {', '.join(npu.get('devices', []))}" + (" [SIMULATED: CPU]" if npu.get("simulated") else "")
+                 + f" · 평균 {_v(o.get('util_avg'), '%')} / 최대 {_v(o.get('util_max'), '%')}"
+                 + f" · 메모리 최대 {_v(o.get('mem_max_gib'))} / {_v(npu.get('mem_total_gib'))} GiB · 샘플 {o.get('samples', 0)}")
+    busy = [p for p in npu.get("phases", []) if p.get("phase") in ("serve", "verify", "soak")]
+    if busy:
+        lines.append("구간별 평균/최대: " + ", ".join(f"{p['phase']} {_v(p.get('util_avg'), '%')}/{_v(p.get('util_max'), '%')}" for p in busy)
+                     + " — 상세 `npu_summary.txt`, 그래프 `npu_utilization.png`")
+    lines.append("")
 lines.append("## 단계별 결과")
 lines.append("")
 lines.append("| 단계 | 내용 | 결과 | 비고 | 시각 |")
@@ -170,7 +192,9 @@ if os.path.exists(_att):
 # 증빙 파일은 한 문단으로 (목록이 길어 report 화면 캡처에서 종합 판정이 위로 밀려나지 않도록)
 files = [os.path.basename(fn) for fn in sorted(glob.glob(os.path.join(a.run_dir, "prep_*")))]
 files += [os.path.basename(fn) for fn in sorted(glob.glob(os.path.join(a.run_dir, "step*")))]
-files += [x for x in ["server.log", "soak_result.csv", "soak_summary.json", "attempts.tsv"] if os.path.exists(os.path.join(a.run_dir, x))]
+files += [x for x in ["server.log", "soak_result.csv", "soak_summary.json", "attempts.tsv", "prep_check.log", "run_timing.tsv",
+                      "npu_samples.csv", "npu_summary.txt", "npu_utilization.png", "npu_utilization.txt"] if os.path.exists(os.path.join(a.run_dir, x))]
+files = list(dict.fromkeys(files))
 lines.append("## 증빙 파일")
 lines.append("")
 lines.append(", ".join(f"`{x}`" for x in files))
@@ -190,6 +214,7 @@ else:
 open(os.path.join(a.run_dir, "report.md"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
 json.dump({"overall": overall, "simulated": simulated, "backend": a.backend, "model": a.model,
            "total_params": total_params, "soak": soak,
+           "npu": ({"devices": npu.get("devices"), "simulated": npu.get("simulated"), "overall": npu.get("overall")} if npu else None),
            "criteria": {k: verdict(v) for k, v in CRITERIA.items()},
            "steps": {int(r["step"]): {"name": r["name"], "result": r["result"], "note": r["note"], "time": r["time"]} for r in rows}},
           open(os.path.join(a.run_dir, "summary.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)

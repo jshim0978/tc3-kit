@@ -1,40 +1,40 @@
-# TC3 VM 런북 — 리허설 · 완전 원복 · 시험 당일(11/3)
+# TC3 VM 런북 — 사전준비 · 리허설 · 시험 당일(11/3)
 
-대상: DUT1(openKcloud) VM `etri-llm-test` (RNGD NPU, Ubuntu 22.04), 백엔드 `furiosa`.
-원칙 (2026-10-16 결정): **리허설 후 VM 을 처음 받은 상태로 완전 원복**(드라이버·SDK·모델 포함) → 시험 당일은 깨끗한 VM 에서
-`install` · `fetch-model` 부터 수행한다. 그래서 **버전은 반드시 고정**하고(아래 2절), 당일 소요 시간·네트워크를 리허설에서 실측한다.
+대상: DUT1(openKcloud) VM `etri-llm-test` (192.168.90.219, RNGD NPU, Ubuntu 22.04), 백엔드 `furiosa`.
+
+**2026-10-20 결정 변경**: VM 에 OS·드라이버/SDK·모델·키트를 **미리 준비해 두고**, 시험 당일에는
+① 사전준비 확인 → ② 시험 스크립트 재생 → ③ 결과 저장·확인 만 한다 (10/16 의 "리허설 후 완전 원복 → 당일 설치" 는 폐기).
+→ **준비된 VM 을 원복하지 말 것.** 4절의 원복 도구는 준비를 처음부터 다시 해야 할 때만 쓴다.
+절차서 본문: `docs/PROCEDURE_v2.md`.
 
 ---
 
 ## 1. 시험 당일 절차 (캡처 순서)
 
-| # | 명령 | 정상 결과 | 예상 소요 (리허설에서 실측해 채움) |
+| # | 명령 | 정상 결과 | 캡처 |
 |---|---|---|---|
-| 0 | `git clone https://github.com/jshim0978/tc3-kit.git && cd tc3-kit && cp tc3.env.example tc3.env` | `Username` → `jshim0978`, `Password` → **읽기 전용 토큰 붙여넣기**(화면에 안 보임) → clone 완료, `git log -1` 커밋 | 30 s |
-| 0c | `bin/tc3 install` | `[1/6]~[6/6]` 후 `PASS install 완료` (종료코드 0) — **종료코드 3 이면 재부팅 필요** | 5–15 min (apt + pip ≈ 수 GB) |
-| 0c' | (3 이면) `sudo reboot` → 재접속 → `bin/tc3 install` | 설치된 항목은 확인만, `PASS install 완료` | 2–5 min |
-| 0e | `bin/tc3 hf-login` | **"HF 토큰 입력" 프롬프트가 뜬 뒤** 토큰 붙여넣기 → Enter (화면에 안 보임) → `PASS HF 접근 확인: <계정> → meta-llama/Llama-3.1-8B-Instruct`. ⚠ 프롬프트 전에 미리 붙여넣으면 터미널이 그대로 화면에 표시함 | 30 s |
-| 0d | `bin/tc3 fetch-model` | 디스크 여유 확인 → 원본 가중치 16 GB + artifact → `PASS fetch-model 완료` | 5–40 min (회선 속도) |
-| 0b | `bin/tc3 preflight` | `preflight: 문제 없음` (고정 버전 일치·SDK import·FXB·포트) | 5 s |
-| 4 | `bin/tc3 env` | `PASS [step 04] env` — lspci `1ed2`, furiosa-smi info/status, furiosa-llm 버전 | 5 s |
-| 5 | `bin/tc3 model-size` | `total parameters = 8,030,261,248 (8.03 B)` + `PASS` | 10 s |
-| 6 | `bin/tc3 serve` | `PASS [step 06] serve` + `furiosa-smi status / ps` 에 furiosa-llm | 1–5 min |
-| 7–9 | `bin/tc3 verify` | 07 `id=Llama-3.1-8B-Instruct`, 08/09 `finish_reason=stop` PASS | 30 s |
-| 10 | `bin/tc3 soak` | `success : 100/100 (100.0%)`, p50/p95, PASS (줄 단위 실시간 표시) | 2–5 min |
-| 11 | `bin/tc3 stop` | `server stopped (connection refused)` + `furiosa-smi ps` 비어 있음, PASS | 5–30 s |
-| 12 | `bin/tc3 report` / `cat evidence/<run>/report.md` | 종합 **PASS**, A~D | 2 s |
-| 끝 | `bin/tc3 hf-logout` (캡처 불필요) | 저장된 토큰 삭제 — 공용 VM 에 토큰을 남기지 않음 | 2 s |
+| ① | `bin/tc3 preflight` (= `./start.sh 1`) | 점검 표의 모든 항목 ✓ (또는 !), `preflight: 문제 없음` | `TC3_prep_preflight.png` |
+| ② | `bin/tc3 live` (= `./start.sh 2`) | 왼쪽 절차 4~12 진행(단계마다 `━━` 머리줄·`→ PASS`), 오른쪽 `furiosa-smi status/ps` 1초 갱신, 끝에 NPU 요약·단계별 경과·`재생 완료` | `TC3_run_00_preflight` ~ `TC3_run_12_report`, `TC3_run_done` |
+| ③ | `bin/tc3 result` (= `./start.sh 3`) · `result --files` · `result --zip` | `종합 판정: PASS`, 주요 로그 출력, `evidence/<run>.zip` | `TC3_result`, `TC3_result_files`, `TC3_result_zip` |
 
-- install·fetch-model 의 전체 출력은 증빙 `evidence/<run>/prep_install.log`, `prep_fetch_model.log` 에도 남는다.
-- 각 단계 첫 줄 `[tc3] run: evidence/<YYYYMMDD-HHMMSS>-furiosa backend: furiosa kit: <commit>` 으로 캡처와 증빙이 1:1 연결.
-- 실패 시 종료코드 ≠ 0 과 `[tc3] FAIL ...` 한 줄 원인. 같은 단계를 다시 하면 같은 run 에 기록되고 report "재수행 이력"에 남는다.
-- 절차 1~3(플랫폼)은 Horizon 캡처.
-- 이 PC 에서 같은 순서로 실행·캡처: `tc3-capture-vm.ps1 -Target llmvm -Clone -RepoUrl https://github.com/jshim0978/tc3-kit.git -Install -HfLogin -Fetch -AllowReboot`
-  (clone 단계에서 GitHub 계정·토큰, hf-login 단계에서 HF 토큰을 사람이 그 창에 입력)
-  (hf-login 단계에서 알림음 → 사람이 그 창에 토큰을 붙여넣고 Enter. 자동화는 토큰을 입력하지 않는다)
-- 원본 가중치는 공식 `meta-llama/Llama-3.1-8B-Instruct` (gated) — 라이선스 동의한 HF 계정 토큰으로 `bin/tc3 hf-login` (2026-10-16 결정).
-  `hf auth login` 대신 쓰는 이유: hub 1.x 의 `hf auth login` 은 브라우저 로그인 메뉴(화살표 선택)가 먼저 떠 원격 터미널에서 실수 여지가 있음.
-  `hf-login` 은 숨김 입력으로 받은 토큰을 `huggingface_hub.login()` 에 stdin 으로 넘겨 같은 위치(`~/.cache/huggingface/token`)에 저장한다.
+- 플랫폼 절차 1~3 은 Horizon 캡처 (접속: 3-2절): Hypervisors · Flavor 의 `pci_passthrough:alias` · Instance `etri-llm-test` Status·Host·IP.
+- 이 PC 에서 같은 순서로 실행·캡처: `.	c3-capture-vm.ps1 -Target llmvm -SshConfig ~/.ssh/tc3_kcloud_config -Mode prep,run,result`
+  (재생 중 단계가 바뀔 때마다 자동 캡처, 캡처마다 화면 검사).
+- 실패하면 원인을 고친 뒤 `bin/tc3 live --from <단계>` — 같은 run 에 이어서 기록되고 report 에 재수행 이력이 남는다.
+- 재생 중 SSH 가 끊겨도 tmux 안에서 계속 돈다 → 다시 접속해 `bin/tc3 live` (새로 돌리지 않고 다시 붙음).
+- 모든 증빙: `evidence/<YYYYMMDD-HHMMSS>-furiosa/` (prep_check, step 로그, npu_samples/summary/utilization, report, RESULT.md, SHA256SUMS).
+
+### 사전준비 (시험 전, VM 에서 한 번)
+
+| # | 명령 | 정상 결과 | 예상 소요 |
+|---|---|---|---|
+| 0 | `git clone https://github.com/jshim0978/tc3-kit.git ~/tc3-kit && cd ~/tc3-kit && cp tc3.env.example tc3.env` | `Username` → `jshim0978`, `Password` → 읽기 전용 토큰(화면에 안 보임) | 30 s |
+| 1 | `bin/tc3 install` | `[1/6]~[6/6]` 후 `PASS install 완료` — 종료코드 3 이면 `sudo reboot` → 재접속 → 다시 | 5–15 min |
+| 2 | `bin/tc3 hf-login` | "HF 토큰 입력" 프롬프트가 뜬 **뒤** 붙여넣기 → `PASS HF 접근 확인` (미리 붙여넣으면 화면에 표시됨) | 30 s |
+| 3 | `bin/tc3 fetch-model` | 원본 16.06 GB + artifact 16.52 GB → `PASS fetch-model 완료` | 인터넷 직결 시 수 분, master3 프록시 경유 ≈ 15 min |
+| 4 | `bin/tc3 hf-logout` | 저장된 토큰 삭제 — 공용 VM 에 토큰을 남기지 않음 | 2 s |
+| 5 | `bin/tc3 preflight` | ✗ 없음 | 5 s |
+| 6 | `bin/tc3 live` 로 한 번 끝까지 (리허설) | 종합 PASS, 단계별 소요 시간 확인 | 5–15 min |
 
 ### 키트 저장소 (비공개 — 2026-10-16 결정)
 
@@ -105,7 +105,7 @@ tmux new -s tc3proxy 'python3 ~/tc3-proxy.py --listen 192.168.90.153:3128 --clie
   시험이 끝나면 `-Undo` 로 되돌림.
 - 브라우저: https://horizon.kcloud.etri:25443 , https://portal.kcloud.etri:25443 (로그인은 사람이 직접).
 
-## 4. 완전 원복 (리허설 후 · 당일 전) — `tools/vm-state.sh`
+## 4. 완전 원복 — `tools/vm-state.sh` (※ 10/20 이후: 준비를 처음부터 다시 할 때만. 준비된 VM 에는 쓰지 않음)
 
 기준 스냅샷과 비교해 **리허설 중 생긴 것만** 지운다: 서버 프로세스 → 추가된 apt 패키지(드라이버·smi·헤더·python3-venv 등) purge →
 추가된 apt 저장소·키 → pip --user → 키트·venv·캐시(HF/pip/uv)·`/models` 의 새 항목 → 홈의 새 항목(.ssh 제외) → 남은 차이 표시.
@@ -141,7 +141,7 @@ ssh llmvm '/var/tmp/vm-state.sh diff /var/tmp/tc3-baseline.txt'                 
 
 ## 6. 검증 근거
 
-- `tests/run_scenarios.sh`: Ubuntu 22.04 컨테이너에서 49개 시나리오 (정상 흐름, furiosa/vllm 스텁 경로 + 실제 가중치, 서버 즉시 사망·시간 초과·이중 기동·포트 점유·SIGTERM 무시·리더만 사망, 잘못된 모델 id·비JSON·빈 응답·간헐 실패·도중 사망, CRLF/BOM/따옴표 tc3.env, 프록시(시스템 프록시 우회·TC3_PROXY 범위), 비루트, LANG=C, 심볼릭 링크, 백엔드 전환, 날짜 넘김, 실제 HF 다운로드).
+- `tests/run_scenarios.sh`: Ubuntu 22.04 컨테이너에서 57개 시나리오 (정상 흐름, furiosa/vllm 스텁 경로 + 실제 가중치, 서버 즉시 사망·시간 초과·이중 기동·포트 점유·SIGTERM 무시·리더만 사망, 잘못된 모델 id·비JSON·빈 응답·간헐 실패·도중 사망, CRLF/BOM/따옴표 tc3.env, 프록시(시스템 프록시 우회·TC3_PROXY 범위), 비루트, LANG=C, 심볼릭 링크, 백엔드 전환, 날짜 넘김, 실제 HF 다운로드).
 - `tests/vm-sim`: 깨끗한 Ubuntu 22.04(SSH) 에서 clone → install(실제 pkg.dev 저장소 등록, venv + uv) → 전 단계 → 캡처 → `vm-state.sh` 원복 → 재현.
 - `tests/proxy-sim.sh`: 인터넷 없는 망(docker --internal)의 VM 이 master3 프록시 흉내만으로 clone·install·fetch-model 완료 (3-1).
 - 실행: `docker compose -f docker/compose.local.yml run --rm --no-deps -T --entrypoint bash tester /kit/tests/run_scenarios.sh`

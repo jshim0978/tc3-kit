@@ -58,7 +58,7 @@ be_install() {
   fi
 
   log "[2/6] 기본 패키지"
-  local miss; mapfile -t miss < <(apt_missing ca-certificates curl gnupg pciutils python3-venv python3-pip)
+  local miss; mapfile -t miss < <(apt_missing ca-certificates curl gnupg pciutils python3-venv python3-pip tmux)
   if (( ${#miss[@]} )); then apt_get update && apt_get install "${miss[@]}" || rc=1
   else ok "기본 패키지 설치됨"; fi
 
@@ -199,42 +199,45 @@ be_serve_stop() {
   if have ray && pgrep -u "$(id -u)" -f 'raylet|gcs_server' >/dev/null 2>&1; then ray stop --force >/dev/null 2>&1 || true; fi
 }
 
+be_monitor_backend() { echo furiosa; }
+be_live_panel_cmd()  { echo "furiosa-smi status; echo; furiosa-smi ps"; }
+# 사전준비 확인 행 (bin/tc3 preflight 의 표) — 버전은 고정값(PIN)과 비교: 다르면 주의(!), TC3_STRICT_VERSIONS=1 이면 문제(✗)
 be_preflight() {
-  local ln; ln="$(lspci -nn 2>/dev/null | grep -iE 'furiosa|\[1ed2:' | head -1)"
-  if [[ -n "$ln" ]]; then pf_ok "RNGD PCI: ${ln:0:100}"; else pf_bad "lspci 에 FuriosaAI(1ed2) 장치 없음 — VM 에 NPU 패스스루 확인"; fi
-  if have furiosa-smi && furiosa-smi info >/dev/null 2>&1; then pf_ok "furiosa-smi info 정상"; else pf_bad "furiosa-smi info 실패 (드라이버/권한)"; fi
+  local ln n; ln="$(lspci -nn 2>/dev/null | grep -iE 'furiosa|\[1ed2:')"; n="$(grep -c . <<< "$ln")"
+  if [[ -n "$ln" ]]; then pf_row ok "RNGD PCI (1ed2)" "1개 이상" "${n}개 — $(head -1 <<< "$ln" | cut -c1-60)"
+  else pf_row bad "RNGD PCI (1ed2)" "1개 이상" "없음" "lspci 에 FuriosaAI(1ed2) 장치 없음 — VM 에 NPU 패스스루(flavor pci alias) 확인"; fi
+  if have furiosa-smi && furiosa-smi info >/dev/null 2>&1; then pf_row ok "furiosa-smi info" "정상" "정상"
+  else pf_row bad "furiosa-smi info" "정상" "실패" "드라이버/권한 확인 (furiosa-smi info)"; fi
   local ver py; ver="$(_furiosa_ver)"; read -ra py <<< "$(_furiosa_py)"
-  if ! have furiosa-llm; then pf_bad "furiosa-llm 없음 (TC3_FURIOSA_VENV=${TC3_FURIOSA_VENV:-미설정})"
-  elif [[ -z "$ver" ]]; then pf_warn "furiosa-llm 있음, 버전 확인 불가"
-  elif _ver_ge "$ver" 2026.2.0; then pf_ok "furiosa-llm $ver (--served-model-name 지원)"
-  else pf_bad "furiosa-llm $ver < 2026.2.0 — --served-model-name 미지원: /v1/models id 가 '$TC3_MODEL_NAME' 이 아니라 절차 7~10 실패 (SDK 업그레이드 필요)"; fi
-  # 고정 버전(PIN)과 실제 설치 버전 일치 — 리허설에서 검증한 조합인지
-  if [[ -n "${TC3_FURIOSA_LLM_PIN:-}" && -n "$ver" ]]; then
-    if [[ "$ver" == "$TC3_FURIOSA_LLM_PIN" ]]; then pf_ok "furiosa-llm = 고정 버전 $TC3_FURIOSA_LLM_PIN"
-    else pf_bad "furiosa-llm $ver ≠ 고정 버전 $TC3_FURIOSA_LLM_PIN → bin/tc3 install"; fi
-  fi
+  if ! have furiosa-llm; then pf_row bad "furiosa-llm" "${TC3_FURIOSA_LLM_PIN:-설치됨}" "없음" "TC3_FURIOSA_VENV=${TC3_FURIOSA_VENV:-미설정} 확인, 사전준비: bin/tc3 install"
+  elif [[ -z "$ver" ]]; then pf_row warn "furiosa-llm" "${TC3_FURIOSA_LLM_PIN:-≥ 2026.2.0}" "버전 확인 불가"
+  elif ! _ver_ge "$ver" 2026.2.0; then pf_row bad "furiosa-llm" "≥ 2026.2.0" "$ver" "--served-model-name 미지원: /v1/models id 가 '$TC3_MODEL_NAME' 이 아니라 절차 7~10 실패 (SDK 2026.2.0 이상 필요)"
+  elif [[ -n "${TC3_FURIOSA_LLM_PIN:-}" ]]; then pf_ver "furiosa-llm" "$TC3_FURIOSA_LLM_PIN" "$ver" "검증한 조합과 다른 SDK. "
+  else pf_row ok "furiosa-llm" "≥ 2026.2.0" "$ver"; fi
   local pair p var pin iv
   for pair in furiosa-driver-rngd:TC3_FURIOSA_DRIVER_PIN furiosa-smi:TC3_FURIOSA_SMI_PIN; do
     p="${pair%%:*}"; var="${pair#*:}"; pin="${!var:-}"
     iv="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)"
-    [[ -z "$pin" ]] && continue
-    if [[ -z "$iv" ]]; then pf_warn "$p 패키지 정보 없음 (dpkg) — 고정 버전 $pin 확인 불가"
-    elif [[ "$iv" == "$pin" ]]; then pf_ok "$p = 고정 버전 $pin"
-    else pf_bad "$p $iv ≠ 고정 버전 $pin → bin/tc3 install"; fi
+    if [[ -z "$pin" ]]; then [[ -n "$iv" ]] && pf_row ok "$p" "(고정 안 함)" "$iv"; continue; fi
+    if [[ -z "$iv" ]]; then pf_row warn "$p" "$pin" "패키지 정보 없음 (dpkg)" "고정 버전 확인 불가"
+    else pf_ver "$p" "$pin" "$iv" "검증한 조합과 다른 버전. "; fi
   done
   # SDK 가 실제로 import 되는지 (의존 패키지 충돌로 serve 가 즉시 죽는 경우를 사전에 잡음)
   if have furiosa-llm; then
-    local ie; if ie="$("${py[@]}" -c 'import furiosa_llm' 2>&1)"; then pf_ok "furiosa_llm import 정상 (${py[*]})"; else pf_bad "furiosa_llm import 실패: ${ie##*$'\n'}"; fi
+    local ie; if ie="$("${py[@]}" -c 'import furiosa_llm' 2>&1)"; then pf_row ok "furiosa_llm import" "정상" "정상 (${py[*]})"
+    else pf_row bad "furiosa_llm import" "정상" "실패: ${ie##*$'\n'}" "venv 의존성 확인"; fi
   fi
-  [[ "${TC3_DEVICES:-}" == *":*" ]] && [[ -n "$ver" ]] && _ver_ge "$ver" 2025.2.0 && pf_warn "TC3_DEVICES=$TC3_DEVICES — 2025.2 이후 문서 표기는 npu:0"
-  local kv; kv="$(uname -r)"; if _ver_ge "${kv%%-*}" 6.3; then pf_ok "커널 $kv (≥ 6.3)"; else pf_warn "커널 $kv — RNGD 드라이버 요구 6.3 이상"; fi
-  if [[ -z "$(ls -A "$TC3_ARTIFACT_DIR" 2>/dev/null)" ]]; then pf_bad "artifact 없음/비어 있음: $TC3_ARTIFACT_DIR → bin/tc3 fetch-model"
+  [[ "${TC3_DEVICES:-}" == *":*" ]] && [[ -n "$ver" ]] && _ver_ge "$ver" 2025.2.0 && pf_row warn "TC3_DEVICES" "npu:0" "$TC3_DEVICES" "2025.2 이후 문서 표기는 npu:0"
+  local kv; kv="$(uname -r)"; if _ver_ge "${kv%%-*}" 6.3; then pf_row ok "커널" "≥ 6.3" "$kv"; else pf_row warn "커널" "≥ 6.3" "$kv" "RNGD 드라이버 요구 6.3 이상"; fi
+  if [[ -z "$(ls -A "$TC3_ARTIFACT_DIR" 2>/dev/null)" ]]; then pf_row bad "artifact" "컴파일된 artifact" "없음/비어 있음: $TC3_ARTIFACT_DIR" "사전준비: bin/tc3 fetch-model"
   else
-    local fxb; fxb="$(find "$TC3_ARTIFACT_DIR" -maxdepth 2 -name '*.fxb' 2>/dev/null | head -1)"
-    if [[ -n "$ver" ]] && _ver_ge "$ver" 2026.4.0 && [[ -z "$fxb" ]]; then pf_bad "SDK $ver 는 FXB 필요 — $TC3_ARTIFACT_DIR 에 .fxb 없음"
-    else pf_ok "artifact: $TC3_ARTIFACT_DIR $( [[ -f "$(_art_src)" ]] && cut -d' ' -f1 "$(_art_src)")"; fi
+    local fxb src; fxb="$(find "$TC3_ARTIFACT_DIR" -maxdepth 2 -name '*.fxb' 2>/dev/null | head -1)"
+    src="$( [[ -f "$(_art_src)" ]] && cut -d' ' -f1 "$(_art_src)")"
+    if [[ -n "$ver" ]] && _ver_ge "$ver" 2026.4.0 && [[ -z "$fxb" ]]; then pf_row bad "artifact" "FXB 포함 (SDK $ver)" "$TC3_ARTIFACT_DIR 에 .fxb 없음" "SDK 2026.4 이상은 FXB artifact 필요"
+    else pf_row ok "artifact" "${TC3_HF_ARTIFACT_REVISION:+@$TC3_HF_ARTIFACT_REVISION }존재" "$(_dir_desc "$TC3_ARTIFACT_DIR")${src:+ — $src}"; fi
   fi
   local busy; busy="$(furiosa-smi ps 2>/dev/null | grep -E '[0-9]+' | grep -viE 'pid|^[+| -]*$' || true)"
-  # furiosa-smi ps 출력 형식은 문서에 고정돼 있지 않아 경고로만 표시
-  if [[ -n "$busy" ]] && ! server_alive; then pf_warn "NPU 를 점유한 프로세스가 있을 수 있음 → furiosa-smi ps 확인"; else pf_ok "NPU 점유 프로세스 없음 (furiosa-smi ps)"; fi
+  # furiosa-smi ps 출력 형식은 문서에 고정돼 있지 않아 주의로만 표시
+  if [[ -n "$busy" ]] && ! server_alive; then pf_row warn "NPU 점유 프로세스" "없음" "있음" "furiosa-smi ps 확인 — 다른 프로세스가 NPU 를 쓰면 serve 가 실패"
+  else pf_row ok "NPU 점유 프로세스" "없음" "없음 (furiosa-smi ps)"; fi
 }

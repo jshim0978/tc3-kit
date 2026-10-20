@@ -1,31 +1,48 @@
 #!/usr/bin/env bash
-# TEST STUB — furiosa-smi 흉내 (tests 전용)
+# TEST STUB — furiosa-smi 흉내 (tests 전용). 표 형식은 2026.1~2026.4 문서의 예시와 같다.
+#   서버(가짜 furiosa-llm 워커 fake_openai.py)가 떠 있으면 메모리 적재·코어 사용률을 보이고, 없으면 '-' (유휴)
+#   STUB_SMI_MODE=garbage → 해석 불가 출력, fail → 종료코드 1 (NPU 모니터 실패 경로 시험용)
+case "${STUB_SMI_MODE:-}" in
+  fail) echo "stub furiosa-smi: device error" >&2; exit 1 ;;
+  garbage) echo "unexpected output format (stub)"; exit 0 ;;
+esac
+# 시나리오의 가짜 워커(fake_openai.py) 또는 vm-sim 에 pip 로 설치된 가짜 furiosa-llm serve
+SERVE_PAT='[f]ake_openai.py|[f]uriosa-llm serve|[_]fake_server.py'
+busy=0; pgrep -f "$SERVE_PAT" >/dev/null && busy=1
 case "${1:-}" in
   --version) echo "furiosa-smi 2026.1.0 (tc3 test stub)" ;;
   info)
-    cat <<'EOF'
-+------+--------+-----------------+-----------------+--------+--------------+
-| Arch | Device | Firmware        | PERT            | Temp.  | PCI-BDF      |
-+------+--------+-----------------+-----------------+--------+--------------+
-| rngd | npu0   | 2026.1.0 (stub) | 2026.1.0 (stub) | 38.5C  | 0000:00:05.0 |
-+------+--------+-----------------+-----------------+--------+--------------+
-EOF
+    if (( busy )); then temp="47.25°C"; pw="61.20 W"; else temp="38.50°C"; pw="35.04 W"; fi
+    printf '%s\n' \
+      "+------+--------+---------------------+---------+---------+--------------+" \
+      "| Arch | Device | Firmware            | Temp.   | Power   | PCI-BDF      |" \
+      "+------+--------+---------------------+---------+---------+--------------+" \
+      "| rngd | npu0   | 1.7.0, stub0000000  | $temp | $pw | 0000:00:05.0 |" \
+      "+------+--------+---------------------+---------+---------+--------------+"
     ;;
   status)
-    cat <<'EOF'
-+------+--------+----------------+------------------+
-| Arch | Device | Cores          | Core Utilization |
-+------+--------+----------------+------------------+
-| rngd | npu0   | 0 (A), 1 (A)   | 0.00%            |
-+------+--------+----------------+------------------+
-EOF
+    if (( busy )); then mem="17.92/47.50 GiB"; pct="   (37.73%)   "
+    else mem=" 0.00/47.50 GiB"; pct="    (0.00%)   "; fi
+    echo "+------+--------+----------+----------------+------------------+"
+    echo "| Arch | Device | Liveness | Memory         | Core Utilization |"
+    echo "+------+--------+----------+----------------+------------------+"
+    for c in 0 1 2 3 4 5 6 7; do
+      if (( busy )); then u="$(printf '%d.%02d%%' $((40 + (RANDOM % 50))) $((RANDOM % 100)))"; else u="-"; fi
+      cell="$(printf 'Core %d: %-7s' "$c" "$u")"
+      case $c in
+        3) printf '| rngd | npu0   | alive    | %s | %-16s |\n' "$mem" "$cell" ;;
+        4) printf '|      |        |          | %s | %-16s |\n' "$pct" "$cell" ;;
+        *) printf '|      |        |          |                | %-16s |\n' "$cell" ;;
+      esac
+    done
+    echo "+------+--------+----------+----------------+------------------+"
     ;;
   ps)
-    echo "+--------+---------+----------------------------------+"
-    echo "| Device | PID     | CMD                              |"
-    echo "+--------+---------+----------------------------------+"
-    for p in $(pgrep -f '[f]ake_openai.py'); do printf '| npu0   | %-7s | %-32s |\n' "$p" "furiosa-llm serve (stub)"; done
-    echo "+--------+---------+----------------------------------+"
+    echo "+---------+--------------+----------------------------------+"
+    echo "| PID     | NPU core     | CMD                              |"
+    echo "+---------+--------------+----------------------------------+"
+    for p in $(pgrep -f "$SERVE_PAT" | head -1); do printf '| %-7s | %-12s | %-32s |\n' "$p" "npu0:[0, 7]" "furiosa-llm serve (stub)"; done
+    echo "+---------+--------------+----------------------------------+"
     ;;
   *) echo "stub furiosa-smi: unsupported: $*" >&2; exit 2 ;;
 esac

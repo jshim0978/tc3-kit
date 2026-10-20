@@ -3,6 +3,8 @@
 
 be_describe()  { echo "NVIDIA GPU + vLLM docker (${TC3_VLLM_IMAGE})"; }
 be_simulated() { echo 0; }
+be_monitor_backend() { echo vllm; }
+be_live_panel_cmd()  { echo "nvidia-smi"; }
 
 be_install() {
   log "Docker / NVIDIA Container Toolkit / vLLM 이미지 확인"
