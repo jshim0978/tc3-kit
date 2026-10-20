@@ -200,7 +200,8 @@ be_serve_stop() {
 }
 
 be_monitor_backend() { echo furiosa; }
-be_live_panel_cmd()  { echo "furiosa-smi status; echo; furiosa-smi ps"; }
+# ps 의 CMD 열은 전체 명령줄(240칸 이상)이라 패널 폭에서 줄바꿈이 심함 → 패널에서만 폭에 맞춰 자름 (증빙 로그는 전체)
+be_live_panel_cmd()  { echo 'furiosa-smi status; echo; furiosa-smi ps | cut -c1-$(( ${TC3_PANEL_COLS:-66} - 1 ))'; }
 # 사전준비 확인 행 (bin/tc3 preflight 의 표) — 버전은 고정값(PIN)과 비교: 다르면 주의(!), TC3_STRICT_VERSIONS=1 이면 문제(✗)
 be_preflight() {
   local ln n; ln="$(lspci -nn 2>/dev/null | grep -iE 'furiosa|\[1ed2:')"; n="$(grep -c . <<< "$ln")"

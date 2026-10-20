@@ -424,8 +424,9 @@ sc_run_mock() {
 sc_run_furiosa() {
   fresh run_furiosa furiosa; furiosa_env
   if [[ -f "$REAL_MODEL/config.json" ]]; then export TC3_MODEL_DIR="$REAL_MODEL" TC3_FIXTURE=0; fi
-  export STUB_SMI_LOG="$SC_DIR/smi_calls.log" STUB_DELAY=3
-  t run --soak-n 3; chk "run exit 0" is $? 0
+  # 초기화 구간에는 샘플을 안 하므로 serve 뒤 짧은 구간에서도 샘플이 잡히도록 0.3초 간격
+  export STUB_SMI_LOG="$SC_DIR/smi_calls.log" STUB_DELAY=3 TC3_MONITOR_INTERVAL=0.3
+  t run --soak-n 20; chk "run exit 0" is $? 0
   local R; R="$(run_dir)"
   # NPU 초기화 구간(serve 기동~준비)에는 furiosa-smi status/info 를 부르지 않아야 한다 (EBUSY 방지)
   chk "init quiet window recorded" bash -c "grep -q '^start' '$R/npu_quiet.tsv' && grep -q '^end' '$R/npu_quiet.tsv'"
@@ -433,11 +434,11 @@ sc_run_furiosa() {
   chk "window lasted while the server started (≥ 2 s)" bash -c "awk -F'\t' '\$1==\"start\"{s=\$2} \$1==\"end\"{e=\$2} END { exit !(e - s >= 2) }' '$R/npu_quiet.tsv'"
   chk "monitor resumed after ready (samples after window)" bash -c "(( \$(wc -l < '$R/npu_samples.csv') > 1 ))"
   chk "quiet flag removed" test ! -e "$R/.npu_quiet"
-  chk "soak used --soak-n 3" has "$R/step10_soak.log" "requests      : 3"
+  chk "soak used --soak-n 20" has "$R/step10_soak.log" "requests      : 20"
   chk "samples parsed from furiosa-smi" grep -q ',furiosa-smi$' "$R/npu_samples.csv"
-  chk "serve-phase samples show NPU memory loaded" bash -c "awk -F, '\$2==\"serve\" && \$5 > 10000' '$R/npu_samples.csv' | grep -q ."
-  chk "serve-phase utilization > 0" bash -c "awk -F, '\$2==\"serve\" && \$4 > 0' '$R/npu_samples.csv' | grep -q ."
-  chk "summary has serve phase" bash -c "grep -q '\"phase\": \"serve\"' '$R/npu_summary.json'"
+  chk "serving-phase samples show NPU memory loaded" bash -c "awk -F, '(\$2==\"serve\" || \$2==\"verify\" || \$2==\"soak\") && \$5 > 10000' '$R/npu_samples.csv' | grep -q ."
+  chk "serving-phase utilization > 0" bash -c "awk -F, '(\$2==\"serve\" || \$2==\"verify\" || \$2==\"soak\") && \$4 > 0' '$R/npu_samples.csv' | grep -q ."
+  chk "summary has a serving phase" bash -c "grep -qE '\"phase\": \"(serve|verify|soak)\"' '$R/npu_summary.json'"
   chk "report E section shows NPU" has "$R/report.md" "E. NPU 점유"
   chk "power/temp parsed from furiosa-smi info" bash -c "awk -F, 'NR > 1 && \$7 != \"\" && \$8 != \"\"' '$R/npu_samples.csv' | grep -q ."
   chk "raw smi output kept for format check" has "$R/npu_raw.log" "Core Utilization"

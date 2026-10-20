@@ -691,6 +691,7 @@ cmd_live() {
 export PATH=$(printf %q "$PATH")
 case "\${LC_ALL:-\${LANG:-}}" in *UTF-8*|*utf8*) ;; *) export LANG=C.UTF-8 ;; esac
 while :; do
+  export TC3_PANEL_COLS="\$(tput cols 2>/dev/null || echo 66)"   # 패널 폭 (출력을 변수로 받기 전에 — 그 안에서는 터미널을 못 봄)
   if [ -e "\$(cat $(printf %q "$(evidence_root)/.current_run") 2>/dev/null)/.npu_quiet" ]; then
     out="\$(printf 'NPU 상태 %s\n\n추론 서버가 NPU 를 초기화하는 중 — 장치 충돌을 막기 위해 조회를 잠시 멈춤\n(서버 준비가 끝나면 다시 표시)\n' "\$(date +%H:%M:%S)")"
   else
