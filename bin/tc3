@@ -78,6 +78,14 @@ fi
 : "${TC3_FIXTURE:=0}"
 TC3_API_URL="${TC3_API_URL%/}"
 export TC3_BACKEND TC3_PORT TC3_API_URL TC3_MODEL_NAME TC3_MODEL_DIR TC3_MIN_PARAMS TC3_ARTIFACT_DIR TC3_DEVICES TC3_VLLM_IMAGE TC3_SOAK_N TC3_SOAK_TIMEOUT TC3_READY_TIMEOUT TC3_FIXTURE
+# 인터넷이 없는 VM: TC3_PROXY(예: master3 의 tools/tc3-proxy.py)로 외부 다운로드(apt·pip/uv·HF·curl)를 경유.
+#   외부에서 받는 명령(install·fetch-model·hf-login·preflight)에서만 켠다 — serve 이후 단계에 넣으면
+#   furiosa-llm(Ray)의 프로세스 간 gRPC 가 http_proxy 를 따라 프록시로 샐 수 있다.
+use_proxy() {
+  [[ -n "${TC3_PROXY:-}" ]] || return 0
+  export http_proxy="$TC3_PROXY" https_proxy="$TC3_PROXY" HTTP_PROXY="$TC3_PROXY" HTTPS_PROXY="$TC3_PROXY"
+  export HF_HUB_DISABLE_XET=1   # HF 의 Xet 전송 대신 일반 HTTPS (프록시 경유가 확실한 경로)
+}
 # 로컬 API 호출이 프록시로 새지 않도록 (VM 에 http_proxy 가 설정된 경우 대비)
 export no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}" NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
 # 파이썬 출력이 tee 파이프에서 버퍼링되지 않게 (soak 진행이 화면에 실시간으로 보이도록)
@@ -117,15 +125,15 @@ _prep() { # _prep <이름> <함수>
   { echo "# exit: $rc"; echo; } >> "$lg"
   return "$rc"
 }
-cmd_install()     { evidence_resume; banner; log "install — $(be_describe)"; _prep install be_install; }
-cmd_fetch_model() { evidence_resume; banner; log "fetch-model — $(be_describe)"; _prep fetch_model be_fetch_model; }
+cmd_install()     { use_proxy; evidence_resume; banner; log "install — $(be_describe)"; _prep install be_install; }
+cmd_fetch_model() { use_proxy; evidence_resume; banner; log "fetch-model — $(be_describe)"; _prep fetch_model be_fetch_model; }
 
 # HF 로그인 (gated 원본 가중치용): 토큰을 숨김 입력으로 받아 huggingface_hub.login() 에 stdin 으로 넘긴다.
 #  - `hf auth login` 은 버전에 따라 브라우저 로그인 메뉴(화살표 선택)가 먼저 떠서 원격 터미널에서 실수 여지가 있음
 #  - 토큰은 화면·프로세스 목록(argv)·로그 어디에도 남지 않고, 표준 위치(~/.cache/huggingface/token)에 저장된다
 _hf_whoami() { python3 -c 'from huggingface_hub import whoami; print(whoami()["name"])' 2>/dev/null; }
 cmd_hf_login() {
-  evidence_resume; banner
+  use_proxy; evidence_resume; banner
   python3 -c 'import huggingface_hub' 2>/dev/null || { fail "huggingface_hub 가 없습니다 — bin/tc3 install 먼저"; return 1; }
   local who tok=""
   if who="$(_hf_whoami)" && [[ -n "$who" ]]; then
@@ -216,6 +224,9 @@ cmd_model_size() {
 
 cmd_serve() {
   evidence_resume; banner
+  # 서버는 로컬 artifact 만 쓴다 — VM 환경(/etc/environment 등)에 프록시가 있어도 서버에는 넘기지 않는다
+  #   (furiosa-llm 의 Ray gRPC 는 노드 IP 로 통신하므로 no_proxy=127.0.0.1 만으로는 프록시로 샐 수 있음)
+  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY grpc_proxy GRPC_PROXY
   local pid="" rc=0
   if ! be_external_server; then
     # 이전에 tc3 가 띄운 서버가 살아 있으면(serve 재실행·중단 후 재시도) 정지하고 다시 띄운다
@@ -364,6 +375,7 @@ pf_ok()   { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 pf_bad()  { printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$*"; PF_BAD=$((PF_BAD + 1)); }
 pf_warn() { printf '  %s!%s %s\n' "$C_YEL" "$C_RESET" "$*"; PF_WARN=$((PF_WARN + 1)); }
 cmd_preflight() {
+  use_proxy
   log "preflight — $(be_describe)"
   log "kit: $KIT_REV  host: $(hostname)  user: $(id -un)  time: $(now_iso)"
   echo "  설정: backend=$TC3_BACKEND model=$TC3_MODEL_NAME port=$TC3_PORT api=$TC3_API_URL soak_n=$TC3_SOAK_N ready_timeout=${TC3_READY_TIMEOUT}s fixture=$TC3_FIXTURE"
@@ -401,7 +413,16 @@ cmd_preflight() {
     elif port_in_use "$TC3_PORT"; then pf_bad "포트 $TC3_PORT 을 다른 프로세스가 사용 중 → $(port_owner_cmd "$TC3_PORT")"
     else pf_ok "포트 $TC3_PORT 비어 있음"; fi
   fi
-  [[ -n "${http_proxy:-}${HTTP_PROXY:-}${https_proxy:-}${HTTPS_PROXY:-}" ]] && pf_ok "프록시 설정 감지 — 127.0.0.1/localhost 는 우회(no_proxy)"
+  if [[ -n "${TC3_PROXY:-}" ]]; then
+    local hc; hc="$(curl -s -o /dev/null -m 15 -w '%{http_code}' https://huggingface.co 2>/dev/null)"
+    if [[ "$hc" =~ ^(2|3) ]]; then pf_ok "TC3_PROXY=$TC3_PROXY 경유 외부 접속 정상 (huggingface.co → $hc)"
+    elif check_weights "$TC3_MODEL_DIR" >/dev/null 2>&1 && [[ "$TC3_BACKEND" != furiosa || -n "$(ls -A "$TC3_ARTIFACT_DIR" 2>/dev/null)" ]]; then
+      # 받을 것을 이미 다 받았으면 serve 이후 단계에는 인터넷이 필요 없다
+      pf_warn "TC3_PROXY=$TC3_PROXY 경유 외부 접속 안 됨 (huggingface.co → ${hc:-연결 안 됨}) — 가중치·artifact 는 이미 있어 시험 단계에는 영향 없음"
+    else pf_bad "TC3_PROXY=$TC3_PROXY 경유 외부 접속 실패 (huggingface.co → ${hc:-연결 안 됨}) — master3 의 tc3-proxy 실행 확인"; fi
+  elif [[ -n "${http_proxy:-}${HTTP_PROXY:-}${https_proxy:-}${HTTPS_PROXY:-}" ]]; then
+    pf_ok "프록시 설정 감지 — 127.0.0.1/localhost 는 우회(no_proxy)"
+  fi
   pf_ok "시각대: $(date '+%Z %z')"
   declare -F be_preflight >/dev/null && be_preflight
   echo

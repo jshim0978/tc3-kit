@@ -27,7 +27,9 @@ param(
   [switch]$Fetch,
   [switch]$AllowReboot,
   [switch]$NoPreflight,
-  [switch]$NoFetch
+  [switch]$NoFetch,
+  # VM 에 인터넷이 없을 때: master3 의 tools/tc3-proxy.py 주소 (예: http://192.168.90.153:3128) — clone 과 tc3.env 의 TC3_PROXY 에 사용
+  [string]$Proxy = ""
 )
 $ErrorActionPreference = "Continue"
 # powershell -File 로 실행하면 배열 인자가 "a,b" 한 문자열로 들어오므로 쉼표로 나눈다
@@ -35,6 +37,8 @@ $Steps   = @($Steps   | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $SshArgs = @($SshArgs | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 # 별도 ssh 설정 파일 (점프 호스트·포트·키를 담은 config) — powershell -File 로도 넘길 수 있는 단일 문자열 인자
 if ($SshConfig) { $SshArgs = @("-F", $SshConfig) + $SshArgs }
+if ($Proxy -and $Proxy -notmatch '^http://[A-Za-z0-9.-]+:[0-9]+$') { Write-Error "-Proxy 형식: http://<주소>:<포트> (예: http://192.168.90.153:3128) — 받은 값: $Proxy"; exit 1 }
+if ($Proxy -and $Clone -and $RepoUrl -notmatch '^https://') { Write-Error "-Proxy 와 함께 쓰는 -RepoUrl 은 https:// 이어야 함 (프록시는 SSH clone 을 중계하지 않음)"; exit 1 }
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -133,10 +137,21 @@ if ($Clone) {
   if (-not $RepoUrl) { Write-Error "-Clone 에는 -RepoUrl 이 필요합니다"; exit 1 }
   # 비공개 저장소면 git 이 Username/Password(토큰)를 묻는다 — 사람이 이 창에 입력 (스크립트는 입력하지 않음)
   if ($RepoUrl -match '^https://') { try { [console]::Beep(880, 250); [console]::Beep(1175, 250) } catch { } }
-  $Results["TC3_step00a_clone"] = Step "TC3_step00a_clone" @("git clone $RepoUrl $KitDir", "cd $KitDir && cp tc3.env.example tc3.env && git log -1 --oneline") "~"
+  if ($Proxy) {
+    $cloneCmds = @("git -c http.proxy=$Proxy clone $RepoUrl $KitDir",
+                   "cd $KitDir && cp tc3.env.example tc3.env && sed -i 's|^TC3_PROXY=.*|TC3_PROXY=$Proxy|' tc3.env && grep '^TC3_PROXY=' tc3.env && git log -1 --oneline")
+  } else {
+    $cloneCmds = @("git clone $RepoUrl $KitDir", "cd $KitDir && cp tc3.env.example tc3.env && git log -1 --oneline")
+  }
+  $Results["TC3_step00a_clone"] = Step "TC3_step00a_clone" $cloneCmds "~"
   if ($Results["TC3_step00a_clone"] -ne 0) {
     Write-Error "git clone 실패 (이미 $KitDir 가 있거나 저장소 접근 불가) — 이전 키트로 진행하지 않도록 중단합니다"; exit 1
   }
+} elseif ($Proxy) {
+  # 이미 있는 키트: tc3.env 의 TC3_PROXY 를 맞춰 둔다 (캡처 없이)
+  $px = Get-Vm "cd $KitDir && { [ -f tc3.env ] || cp tc3.env.example tc3.env; } && { grep -q '^TC3_PROXY=' tc3.env || echo 'TC3_PROXY=' >> tc3.env; } && sed -i 's|^TC3_PROXY=.*|TC3_PROXY=$Proxy|' tc3.env && grep '^TC3_PROXY=' tc3.env"
+  if ("$px" -ne "TC3_PROXY=$Proxy") { Write-Error "tc3.env 에 TC3_PROXY 를 설정하지 못함 ($KitDir/tc3.env 확인): $px"; exit 1 }
+  Write-Host "tc3.env: $px" -ForegroundColor Cyan
 }
 $Results["TC3_step00_vm_and_kit"] = Step "TC3_step00_vm_and_kit" @("hostname; grep PRETTY_NAME /etc/os-release; uname -r", "git log -1 --oneline", "grep -E '^TC3_(BACKEND|MODEL_NAME|MODEL_DIR|ARTIFACT_DIR|DEVICES|SOAK_N|PORT)=' tc3.env")
 

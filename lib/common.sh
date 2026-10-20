@@ -198,7 +198,11 @@ PYEOF
 #   - 부팅 직후 unattended-upgrades 가 잡은 잠금을 최대 10분 대기 (Could not get lock 방지)
 #   - 비대화형 + needrestart 자동 (jammy 의 "재시작할 서비스" 대화상자에 멈추지 않도록)
 SUDO=""; (( EUID != 0 )) && SUDO="sudo"   # root(컨테이너 등)면 sudo 없이
-apt_get() { $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=600 -y "$@"; }
+#   - TC3_PROXY 가 있으면 apt 에 직접 넘긴다 (sudo 는 http_proxy 환경변수를 버림). 파이프라이닝은 끈다 (tc3-proxy 는 연결당 요청 1건)
+apt_get() {
+  local px=(); [[ -n "${TC3_PROXY:-}" ]] && px=(-o "Acquire::http::Proxy=$TC3_PROXY" -o "Acquire::https::Proxy=$TC3_PROXY" -o "Acquire::http::Pipeline-Depth=0")
+  $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=600 "${px[@]}" -y "$@"
+}
 # apt_missing <pkg...> : 설치 안 된 패키지 이름만 출력
 apt_missing() { local p; for p in "$@"; do dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || echo "$p"; done; }
 

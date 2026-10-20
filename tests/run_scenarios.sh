@@ -288,6 +288,56 @@ sc_proxy_env() {
   for s in 6 7 8 9 10 11; do chk "$s PASS" is "$(st $s)" PASS; done
 }
 
+sc_proxy_scoped() {
+  fresh proxy_scoped furiosa; furiosa_env
+  # TC3_PROXY = 모든 목적지를 거부하는 실제 tc3-proxy: 받는 명령(preflight·fetch-model)은 프록시에 기록(DENY)되고,
+  # serve 이후 단계는 프록시에 아무것도 남기지 않아야 한다. VM 환경에서 물려받은 http_proxy 도 서버에는 넘어가지 않아야 한다.
+  local pxport=$((PORT + 1000)) pxlog="$SC_DIR/proxy.log"
+  python3 "$KIT/tools/tc3-proxy.py" --listen "127.0.0.1:$pxport" --allow none.invalid --log "$pxlog" >> "$SC_LOG" 2>&1 &
+  local pxpid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do port_open "$pxport" && break; sleep 0.3; done
+  chk "local tc3-proxy up" port_open "$pxport"
+  sed -i "s|^TC3_PROXY=.*|TC3_PROXY=http://127.0.0.1:$pxport|" "$SC_ENV"
+  export http_proxy="http://127.0.0.1:$pxport" HTTPS_PROXY="http://127.0.0.1:$pxport"   # VM 환경에 이미 있던 프록시 흉내
+  local rc=0 pid n0 n1
+  touch "$pxlog"; n0="$(wc -l < "$pxlog")"
+  t serve || rc=1
+  pid="$(pgrep -f 'furiosa-llm serve' | head -1)"
+  chk "server process found" test -n "$pid"
+  chk "server env has no http(s)_proxy (inherited one dropped)" bash -c "! tr '\0' '\n' < /proc/$pid/environ | grep -qiE '^(https?|all|grpc)_proxy='"
+  for c in verify soak stop; do t "$c" || rc=1; done
+  n1="$(wc -l < "$pxlog")"
+  chk "serve/verify/soak/stop ok with TC3_PROXY set" is "$rc" 0
+  for s in 6 7 8 9 10 11; do chk "$s PASS" is "$(st $s)" PASS; done
+  chk "serve..stop sent nothing to the proxy" is "$n1" "$n0"
+  unset http_proxy HTTPS_PROXY
+  t preflight
+  chk "preflight checked HF through TC3_PROXY (DENY logged)" grep -q 'CONNECT huggingface.co:443 DENY' "$pxlog"
+  chk "preflight reports the proxy path down (weights missing → ✗)" has "$SC_LOG" "경유 외부 접속 실패"
+  python3 -c 'import huggingface_hub' 2>/dev/null || python3 -m pip install -q huggingface_hub >/dev/null 2>&1
+  if python3 -c 'import huggingface_hub' 2>/dev/null; then
+    : > "$pxlog"
+    export TC3_HF_REPO_MODEL=hf-internal-testing/tiny-random-LlamaForCausalLM TC3_MODEL_DIR="$SC_DIR/weights" TC3_FETCH_MIN_FREE_GB=1
+    t fetch-model; chk "fetch-model fails when the proxy denies HF" is "$(( $? != 0 ))" 1
+    chk "fetch-model went through TC3_PROXY (DENY logged)" grep -q 'huggingface.co:443 DENY' "$pxlog"
+    chk "nothing downloaded" test ! -e "$SC_DIR/weights/config.json"
+  else skip "huggingface_hub 없음 — fetch-model 경유 확인 생략"; fi
+  # 가중치·artifact 가 이미 있으면 프록시가 꺼져 있어도 preflight 는 ✗ 가 아니라 주의(!)
+  mkdir -p "$SC_DIR/w2"; echo '{}' > "$SC_DIR/w2/config.json"; : > "$SC_DIR/w2/model.safetensors"
+  TC3_FIXTURE=0 TC3_MODEL_DIR="$SC_DIR/w2" t preflight
+  chk "proxy down after downloads → warning, not failure" has "$SC_LOG" "시험 단계에는 영향 없음"
+  kill "$pxpid" 2>/dev/null
+  mkdir -p "$SC_DIR/stub"; printf '#!/bin/sh\necho "apt-get $*"\n' > "$SC_DIR/stub/apt-get"; chmod +x "$SC_DIR/stub/apt-get"
+  local a1 a2
+  a1="$(PATH="$SC_DIR/stub:$PATH" TC3_PROXY=http://10.0.0.1:3128 bash -c 'TC3_HOME="$1"; source "$1/lib/common.sh"; SUDO=""; apt_get update' _ "$KIT")"
+  a2="$(PATH="$SC_DIR/stub:$PATH" TC3_PROXY= bash -c 'TC3_HOME="$1"; source "$1/lib/common.sh"; SUDO=""; apt_get update' _ "$KIT")"
+  echo "$a1" >> "$SC_LOG"; echo "$a2" >> "$SC_LOG"
+  chk "apt gets Acquire::http::Proxy" has <(echo "$a1") "Acquire::http::Proxy=http://10.0.0.1:3128"
+  chk "apt gets Acquire::https::Proxy" has <(echo "$a1") "Acquire::https::Proxy=http://10.0.0.1:3128"
+  chk "apt pipelining off behind proxy" has <(echo "$a1") "Acquire::http::Pipeline-Depth=0"
+  chk "no proxy options without TC3_PROXY" hasnt <(echo "$a2") "Acquire::"
+}
+
 sc_env_bom() {
   fresh env_bom mock
   unset TC3_BACKEND TC3_PORT TC3_API_URL
@@ -541,7 +591,7 @@ ALL=(mock_all mock_steps furiosa_full serve_dies_fast serve_timeout serve_twice 
      env_quotes_nonl symlink_and_cwd no_jq lang_c rerun_step stale_run report_incomplete stop_nothing cli_misuse platform_manual
      soak_100 lspci_novendor lspci_none vllm_full ctrl_c_serve path_with_spaces nonroot timezone
      proxy_env env_bom soak_live_output backend_switch preflight_ok preflight_bad stop_stubborn old_sdk
-     port_mismatch leader_dies ver_compare report_stale_soak platform_os_fail hf_login_flow fetch_model_net)
+     port_mismatch leader_dies ver_compare report_stale_soak platform_os_fail hf_login_flow fetch_model_net proxy_scoped)
 
 i=0
 for name in "${ALL[@]}"; do

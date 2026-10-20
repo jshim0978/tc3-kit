@@ -62,12 +62,12 @@
 
 1. **접속**: 이 PC → (점프 호스트) → VM. `~/.ssh/config` 에 `Host llmvm`, 키 인증. `ssh llmvm hostname`.
    리허설 자동화를 위해 sudo 가 암호를 묻지 않아야 한다(또는 sudo 가 필요한 install 은 사용자가 직접 실행) — 자동화가 암호를 입력하지 않는다.
-2. **기준 스냅샷 (가장 먼저, 아무것도 설치하기 전)**:
+2. **첫 점검 + 기준 스냅샷 (가장 먼저, 아무것도 설치하기 전)**: `scp tools/vm-check.sh llmvm:/var/tmp/ && ssh llmvm 'bash /var/tmp/vm-check.sh'` (읽기 전용) 후
    `scp tools/vm-state.sh llmvm:/var/tmp/ && ssh llmvm '/var/tmp/vm-state.sh snapshot /var/tmp/tc3-baseline.txt'`
 3. **기본 정보**: `grep PRETTY /etc/os-release; uname -r; nproc; free -g; df -h / ; timedatectl; lspci -nn | grep -iE 'furiosa|1ed2'`
    (커널 < 6.3 이면 install 이 HWE 커널 설치 후 재부팅을 요구 — 원복 시 커널 처리 주의, 4절)
 4. **네트워크**: `curl -sI https://github.com https://huggingface.co https://pypi.org http://asia-northeast3-apt.pkg.dev | grep HTTP`
-   + 프록시 여부. 막혀 있으면 오프라인 반입 계획으로 전환.
+   + `grep -h ^deb /etc/apt/sources.list /etc/apt/sources.list.d/*.list` (apt 미러 이름). 막혀 있으면 → **3-1 master3 프록시**.
 5. **HF 원본 가중치 접근** (결정: 공식 meta-llama): 사용자가 Llama 3.1 라이선스 동의한 HF 계정을 제공 → install 후 `bin/tc3 hf-login` 에서 사용자가 토큰 입력.
    원복 때 `~/.cache/huggingface`(토큰 포함)가 지워지므로 시험 당일 다시 `hf-login` 한다.
 6. **당일과 같은 전체 흐름 + 캡처** (이 PC, 보이는 창 — hf-login 단계에서 사용자가 토큰 입력):
@@ -76,6 +76,34 @@
 7. **실기기 확인 항목**: serve 두 번, serve 중 stop, stop 후 `furiosa-smi ps` 빈 것, soak 100회 시간, 서버 기동 시간(`TC3_READY_TIMEOUT` 여유),
    `furiosa-smi ps` 출력 형식, Ray 데몬 잔존 여부(조합 A).
 8. **결정 사항 커밋** (조합 A/B, HF 저장소, 소요 시간) → 저장소 push → 4절 원복 → 원복 후 같은 흐름을 한 번 더 돌려 "깨끗한 상태에서 재현" 확인 → 다시 원복.
+
+### 3-1. VM 에 인터넷이 없을 때 — master3 허용 목록 프록시 (`tools/tc3-proxy.py`)
+
+시범서비스 VM 망(192.168.90.0/24)의 게이트웨이는 사내망 스위치라 인터넷이 안 될 수 있다. master3(192.168.90.153)는 인터넷이 된다
+(2026-10-20 실측: HF CDN ≈ 37 MB/s → fetch-model 32.6 GB(원본 16.06 + artifact 16.52) ≈ 15 분). 플랫폼 담당 승인 후:
+
+```
+scp -F ~/.ssh/tc3_kcloud_config tools/tc3-proxy.py kcloud-master3:~/          # 이 PC 에서
+ssh -F ~/.ssh/tc3_kcloud_config kcloud-master3                                  # master3 (sudo 불필요)
+tmux new -s tc3proxy 'python3 ~/tc3-proxy.py --listen 192.168.90.153:3128 --client <VM IP> --log ~/tc3-proxy.log'
+```
+- VM 쪽: `tc3-capture-vm.ps1 ... -Proxy http://192.168.90.153:3128` → clone 은 `git -c http.proxy=...`, `tc3.env` 의 `TC3_PROXY` 를 자동 설정.
+  `TC3_PROXY` 는 받는 명령(install·fetch-model·hf-login·preflight)에만 쓰이고 serve 이후 단계에는 섞이지 않는다
+  (furiosa-llm 의 Ray gRPC 가 http_proxy 를 따라가지 않도록). preflight 가 "프록시 경유 외부 접속 정상/실패" 를 보여준다.
+- 허용 목록: github, huggingface/hf.co(CDN `*.cdn.hf.co` 포함), pypi/pythonhosted, pytorch.org(인덱스 `download.`, 휠 `download-r2.`), ubuntu.com, pkg.dev, packages.cloud.google.com.
+  VM 이미지의 apt 미러가 다른 도메인이면 `--allow-extra <도메인>` 추가 (거부는 로그에 `DENY` 로 남음: `tail -f ~/tc3-proxy.log`).
+- CONNECT 는 443 만, 평문 HTTP 는 80 만, `--client` 밖 접속은 403. 리허설·시험이 끝나면 tmux 창에서 Ctrl+C 로 종료.
+- 검증: `bash tests/proxy-sim.sh` (25항목) — 인터넷 없는 망의 VM 흉내에서 clone·preflight·install(apt·pkg.dev·pip/uv)·fetch-model 이 프록시만으로 끝나고,
+  실제 furiosa-llm 2026.3.0 의존성(uv --torch-backend=auto)이 거부 없이 해석되며, serve~stop 동안 프록시 사용 0건,
+  다른 클라이언트·허용 밖 목적지·443 외 포트는 프록시가 403. 프록시가 꺼져도 가중치·artifact 가 이미 있으면 preflight 는 주의(!)만.
+
+### 3-2. 이 PC 에서 Horizon/포털 접속 (VM 생성·재구성용)
+
+- 터널: `ssh -F ~/.ssh/tc3_kcloud_config -N kcloud-tunnel` (= `ssh -L 25443:210.114.95.50:25443 openkcloud@101.79.0.102 -p 122`, 창을 닫으면 끊김)
+- 한 번만 (관리자, UAC 확인): `powershell -ExecutionPolicy Bypass -File tools\kcloud-pc-access.ps1`
+  → kcloud-root-ca 신뢰 등록(SHA-256 `4D90B981…2EF9C6AF` 일치할 때만) + hosts `127.0.0.1 horizon|portal|temporal|keycloak.kcloud.etri` + HTTPS 확인.
+  시험이 끝나면 `-Undo` 로 되돌림.
+- 브라우저: https://horizon.kcloud.etri:25443 , https://portal.kcloud.etri:25443 (로그인은 사람이 직접).
 
 ## 4. 완전 원복 (리허설 후 · 당일 전) — `tools/vm-state.sh`
 
@@ -113,6 +141,7 @@ ssh llmvm '/var/tmp/vm-state.sh diff /var/tmp/tc3-baseline.txt'                 
 
 ## 6. 검증 근거
 
-- `tests/run_scenarios.sh`: Ubuntu 22.04 컨테이너에서 48개 시나리오 (정상 흐름, furiosa/vllm 스텁 경로 + 실제 가중치, 서버 즉시 사망·시간 초과·이중 기동·포트 점유·SIGTERM 무시·리더만 사망, 잘못된 모델 id·비JSON·빈 응답·간헐 실패·도중 사망, CRLF/BOM/따옴표 tc3.env, 프록시, 비루트, LANG=C, 심볼릭 링크, 백엔드 전환, 날짜 넘김, 실제 HF 다운로드).
+- `tests/run_scenarios.sh`: Ubuntu 22.04 컨테이너에서 49개 시나리오 (정상 흐름, furiosa/vllm 스텁 경로 + 실제 가중치, 서버 즉시 사망·시간 초과·이중 기동·포트 점유·SIGTERM 무시·리더만 사망, 잘못된 모델 id·비JSON·빈 응답·간헐 실패·도중 사망, CRLF/BOM/따옴표 tc3.env, 프록시(시스템 프록시 우회·TC3_PROXY 범위), 비루트, LANG=C, 심볼릭 링크, 백엔드 전환, 날짜 넘김, 실제 HF 다운로드).
 - `tests/vm-sim`: 깨끗한 Ubuntu 22.04(SSH) 에서 clone → install(실제 pkg.dev 저장소 등록, venv + uv) → 전 단계 → 캡처 → `vm-state.sh` 원복 → 재현.
+- `tests/proxy-sim.sh`: 인터넷 없는 망(docker --internal)의 VM 이 master3 프록시 흉내만으로 clone·install·fetch-model 완료 (3-1).
 - 실행: `docker compose -f docker/compose.local.yml run --rm --no-deps -T --entrypoint bash tester /kit/tests/run_scenarios.sh`

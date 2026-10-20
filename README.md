@@ -112,13 +112,16 @@ bin/tc3 stop         # [11]
 bin/tc3 report       # report.md
 # 또는 한 번에: bin/tc3 all
 ```
-플랫폼 증빙 [1~3] 은 Horizon(또는 master3 의 openstack CLI)에서 캡처합니다: Hypervisors / Flavor `m1.large.rngd` 의 `pci_passthrough:alias` / Instance `etri-llm-test` 의 Status·Host·IP.
+플랫폼 증빙 [1~3] 은 Horizon(또는 master3 의 openstack CLI)에서 캡처합니다: Hypervisors / Flavor `m1.xlarge.rngd`(16 vCPU / 64 GB / 200 GB) 의 `pci_passthrough:alias` / Instance `etri-llm-test` 의 Status·Host·IP.
 
 ## 검증 · 런북
-- `tests/run_scenarios.sh` — Ubuntu 22.04 컨테이너에서 48개 시나리오(정상·고장 주입·운영 실수) 자동 검증:
+- `tests/run_scenarios.sh` — Ubuntu 22.04 컨테이너에서 49개 시나리오(정상·고장 주입·운영 실수) 자동 검증:
   `docker compose -f docker/compose.local.yml run --rm --no-deps -T --entrypoint bash tester /kit/tests/run_scenarios.sh`
 - `docs/VM_RUNBOOK.md` — 리허설 체크리스트, SDK 버전별 결정표, 원복(wipe), 당일 장애 대응
-- `tc3-capture-vm.ps1` — VM 에서 SSH 로 절차를 실행하며 단계별 터미널 화면 캡처 (`tests/vm-sim` 으로 리허설 가능)
+- `tc3-capture-vm.ps1` — VM 에서 SSH 로 절차를 실행하며 단계별 터미널 화면 캡처 (`tests/vm-sim` 으로 리허설 가능, 인터넷 없는 VM 은 `-Proxy`)
+- `tools/vm-check.sh` — 새 VM 첫 접속 점검(읽기 전용: NPU·디스크·sudo·인터넷/프록시), `tools/vm-state.sh` — 기준 스냅샷·원복
+- `tools/tc3-proxy.py` + `tests/proxy-sim.sh` — VM 에 인터넷이 없을 때 master3 허용 목록 프록시와 그 검증 (런북 3-1)
+- `tools/kcloud-pc-access.ps1` — 이 PC 에서 Horizon/포털 접속 준비 (CA 신뢰 + hosts, 관리자; 런북 3-2)
 
 ## 증빙(evidence) 규칙
 - 모든 단계는 `capture` 로 실행되어 **화면에 `$ 명령` → 출력** 순으로 보이고, 같은 내용이 `stepNN_<slug>.log` 에
