@@ -131,10 +131,15 @@ be_env_check() {
 be_fetch_model() {
   export HF_TOKEN="${HF_TOKEN:-}"
   ensure_dir "$TC3_MODEL_DIR" && ensure_dir "$TC3_ARTIFACT_DIR" || { fail "모델 디렉터리를 만들 수 없음: $TC3_MODEL_DIR / $TC3_ARTIFACT_DIR"; return 1; }
-  local need="${TC3_FETCH_MIN_FREE_GB:-40}" free
-  free="$(df -Pk "$TC3_MODEL_DIR" | awk 'NR == 2 { print int($4 / 1048576) }')"
-  if (( free < need )); then fail "디스크 여유 ${free} GB < ${need} GB ($TC3_MODEL_DIR) — 가중치(~16 GB)+artifact 저장 공간 부족"; return 1; fi
-  ok "디스크 여유 ${free} GB (필요 ≥ ${need} GB)"
+  # 필요한 여유 = TC3_FETCH_MIN_FREE_GB − 이미 받아 둔 양 (다시 실행할 때 이미 받은 파일 때문에 막히지 않도록)
+  local need_kb have_kb free_kb
+  have_kb="$(du -sk --apparent-size "$TC3_MODEL_DIR" "$TC3_ARTIFACT_DIR" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')"
+  need_kb=$(( ${TC3_FETCH_MIN_FREE_GB:-40} * 1048576 - have_kb )); (( need_kb < 0 )) && need_kb=0
+  free_kb="$(df -Pk "$TC3_MODEL_DIR" | awk 'NR == 2 { print $4 }')"
+  if (( free_kb < need_kb )); then
+    fail "디스크 여유 $((free_kb / 1048576)) GB < 추가로 필요한 $(( (need_kb + 1048575) / 1048576 )) GB ($TC3_MODEL_DIR) — 가중치(~16 GB)+artifact 저장 공간 부족"; return 1
+  fi
+  ok "디스크 여유 $((free_kb / 1048576)) GB (추가로 필요 ≥ $(( (need_kb + 1048575) / 1048576 )) GB, 이미 받은 $((have_kb / 1048576)) GB 제외)"
   hf_access "$TC3_HF_REPO_MODEL" || { fail "→ bin/tc3 hf-login 으로 로그인한 뒤 다시 실행"; return 1; }
   log "원본 가중치(파라미터 수 산출용): $TC3_HF_REPO_MODEL → $TC3_MODEL_DIR"
   hf_download "$TC3_HF_REPO_MODEL" "$TC3_MODEL_DIR" "" "*.json" "*.safetensors" "tokenizer*" || return 1

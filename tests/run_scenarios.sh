@@ -637,6 +637,12 @@ sc_fetch_model_net() {
   TC3_FETCH_MIN_FREE_GB=999999 t fetch-model; chk "refuses when disk space is insufficient" is "$(( $? != 0 ))" 1
   chk "explains disk space" has "$SC_LOG" "디스크 여유"
   chk "nothing downloaded before the space check" test ! -e "$SC_DIR/weights/config.json"
+  # 이미 받아 둔 양은 필요한 여유에서 뺀다 — 여유보다 1 GB 많은 기준이라도, 받아 둔 2 GB(희소 파일)가 있으면 통과해야 함
+  mkdir -p "$SC_DIR/weights" && truncate -s 2G "$SC_DIR/weights/already-downloaded.bin"
+  local free_gb; free_gb="$(df -Pk "$SC_DIR" | awk 'NR == 2 { print int($4 / 1048576) }')"
+  TC3_FETCH_MIN_FREE_GB=$((free_gb + 1)) t fetch-model; chk "already-downloaded data counts toward the space requirement" is $? 0
+  chk "explains the space calculation" has "$SC_LOG" "이미 받은 2 GB 제외"
+  rm -f "$SC_DIR/weights/already-downloaded.bin"
   export TC3_FETCH_MIN_FREE_GB=1   # 작은 테스트 저장소라 1 GB 면 충분
   t fetch-model; chk "fetch-model exit 0" is $? 0
   chk "gated-access check ran" has "$SC_LOG" "HF 접근 가능"
