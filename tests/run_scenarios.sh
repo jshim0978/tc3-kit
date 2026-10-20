@@ -424,8 +424,15 @@ sc_run_mock() {
 sc_run_furiosa() {
   fresh run_furiosa furiosa; furiosa_env
   if [[ -f "$REAL_MODEL/config.json" ]]; then export TC3_MODEL_DIR="$REAL_MODEL" TC3_FIXTURE=0; fi
+  export STUB_SMI_LOG="$SC_DIR/smi_calls.log" STUB_DELAY=3
   t run --soak-n 3; chk "run exit 0" is $? 0
   local R; R="$(run_dir)"
+  # NPU 초기화 구간(serve 기동~준비)에는 furiosa-smi status/info 를 부르지 않아야 한다 (EBUSY 방지)
+  chk "init quiet window recorded" bash -c "grep -q '^start' '$R/npu_quiet.tsv' && grep -q '^end' '$R/npu_quiet.tsv'"
+  chk "no furiosa-smi status/info inside the init window" bash -c "awk 'NR==FNR { if (\$1==\"start\") s=\$2; if (\$1==\"end\") e=\$2; next } (\$2==\"status\" || \$2==\"info\") && \$1 > s && \$1 < e { bad++ } END { exit bad > 0 }' FS='\t' '$R/npu_quiet.tsv' FS=' ' '$STUB_SMI_LOG'"
+  chk "window lasted while the server started (≥ 2 s)" bash -c "awk -F'\t' '\$1==\"start\"{s=\$2} \$1==\"end\"{e=\$2} END { exit !(e - s >= 2) }' '$R/npu_quiet.tsv'"
+  chk "monitor resumed after ready (samples after window)" bash -c "(( \$(wc -l < '$R/npu_samples.csv') > 1 ))"
+  chk "quiet flag removed" test ! -e "$R/.npu_quiet"
   chk "soak used --soak-n 3" has "$R/step10_soak.log" "requests      : 3"
   chk "samples parsed from furiosa-smi" grep -q ',furiosa-smi$' "$R/npu_samples.csv"
   chk "serve-phase samples show NPU memory loaded" bash -c "awk -F, '\$2==\"serve\" && \$5 > 10000' '$R/npu_samples.csv' | grep -q ."

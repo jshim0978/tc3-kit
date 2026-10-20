@@ -260,10 +260,14 @@ cmd_serve() {
       record 6 serve FAIL "포트 ${TC3_PORT} 이 다른 프로세스에 사용 중 — 해당 프로세스 정리 후 재실행"; return 1
     fi
   fi
+  # NPU 초기화 구간(기동 ~ 준비 완료): NPU 모니터·live 패널의 furiosa-smi 조회를 멈춘다
+  #   (10/20 etri-llm-test 에서 기동 중 "EBUSY: Device or resource busy" — 장치를 여는 순간 다른 조회와 겹치지 않도록)
+  _npu_quiet start
   be_serve_start
   be_external_server || pid="$(server_pid)"
   log "준비 대기: $TC3_API_URL/v1/models (최대 ${TC3_READY_TIMEOUT}s)"
   wait_http "$TC3_API_URL/v1/models" "$TC3_READY_TIMEOUT" "$pid"; rc=$?
+  _npu_quiet end
   if (( rc == 0 )); then
     capture 6 serve_log "서버 기동 로그 (마지막 40줄)" -- "tail -n 40 '$TC3_RUN_DIR/server.log'" || true
     be_accel_status 6
@@ -279,6 +283,13 @@ cmd_serve() {
     fi
     return 1
   fi
+}
+
+# _npu_quiet start|end : <run>/.npu_quiet 파일이 있는 동안 모니터·패널은 furiosa-smi 를 부르지 않는다 (구간은 npu_quiet.tsv 에 기록)
+_npu_quiet() {
+  [[ "${TC3_NPU_QUIET_INIT:-1}" == 1 ]] || return 0
+  if [[ "$1" == start ]]; then : > "$TC3_RUN_DIR/.npu_quiet"; else rm -f "$TC3_RUN_DIR/.npu_quiet"; fi
+  printf '%s\t%s\t%s\n' "$1" "$EPOCHREALTIME" "$(now_iso)" >> "$TC3_RUN_DIR/npu_quiet.tsv"
 }
 
 _write_req() { # _write_req <file> <prompt>
@@ -576,6 +587,7 @@ _run_abort() {
   trap - INT TERM
   echo; warn "재생 중단 (Ctrl+C) — 서버를 정리하고 끝냅니다"
   _phase aborted
+  rm -f "$TC3_RUN_DIR/.npu_quiet"
   cmd_stop || true
   _monitor_stop
   exit 130
@@ -679,7 +691,11 @@ cmd_live() {
 export PATH=$(printf %q "$PATH")
 case "\${LC_ALL:-\${LANG:-}}" in *UTF-8*|*utf8*) ;; *) export LANG=C.UTF-8 ;; esac
 while :; do
-  out="\$( { echo "NPU 상태 \$(date +%H:%M:%S) — 1초마다 갱신"; echo; $panel; } 2>&1 )"
+  if [ -e "\$(cat $(printf %q "$(evidence_root)/.current_run") 2>/dev/null)/.npu_quiet" ]; then
+    out="\$(printf 'NPU 상태 %s\n\n추론 서버가 NPU 를 초기화하는 중 — 장치 충돌을 막기 위해 조회를 잠시 멈춤\n(서버 준비가 끝나면 다시 표시)\n' "\$(date +%H:%M:%S)")"
+  else
+    out="\$( { echo "NPU 상태 \$(date +%H:%M:%S) — 1초마다 갱신"; echo; $panel; } 2>&1 )"
+  fi
   printf '\033[H\033[2J%s\n' "\$out"
   sleep 1
 done

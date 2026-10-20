@@ -2,6 +2,7 @@
 # TEST STUB — furiosa-smi 흉내 (tests 전용). 표 형식은 2026.1~2026.4 문서의 예시와 같다.
 #   서버(가짜 furiosa-llm 워커 fake_openai.py)가 떠 있으면 메모리 적재·코어 사용률을 보이고, 없으면 '-' (유휴)
 #   STUB_SMI_MODE=garbage → 해석 불가 출력, fail → 종료코드 1 (NPU 모니터 실패 경로 시험용)
+[[ -n "${STUB_SMI_LOG:-}" ]] && printf '%s %s\n' "$EPOCHREALTIME" "${1:-}" >> "$STUB_SMI_LOG"   # 호출 시각 기록 (초기화 구간 검사용)
 case "${STUB_SMI_MODE:-}" in
   fail) echo "stub furiosa-smi: device error" >&2; exit 1 ;;
   garbage) echo "unexpected output format (stub)"; exit 0 ;;

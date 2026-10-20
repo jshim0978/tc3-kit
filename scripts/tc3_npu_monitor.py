@@ -245,8 +245,17 @@ t_start = time.monotonic()
 last_inline = 0.0
 fails = 0
 warned = False
+quiet_said = False
 while not STOP:
     t0 = time.monotonic()
+    # 추론 서버가 NPU 를 여는 동안(bin/tc3 serve 가 <run>/.npu_quiet 를 둠)은 furiosa-smi 를 부르지 않는다 — 장치 충돌(EBUSY) 방지
+    if os.path.exists(os.path.join(a.out, ".npu_quiet")):
+        if a.inline and not quiet_said:
+            print("  \033[2m▸ NPU 조회 일시 중지 — 서버가 NPU 를 초기화하는 중\033[0m", flush=True)
+        quiet_said = True
+        time.sleep(0.2)
+        continue
+    quiet_said = False
     try:
         rows = SAMPLERS[a.backend]()
     except Exception as e:  # noqa: BLE001 — 어떤 오류도 시험을 멈추지 않게
