@@ -217,7 +217,9 @@ apt_get() {
   $SUDO env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=600 "${px[@]}" -y "$@"
 }
 # apt_missing <pkg...> : 설치 안 된 패키지 이름만 출력
-apt_missing() { local p; for p in "$@"; do dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || echo "$p"; done; }
+#   상태 필드로 판단 — 'hold ok installed'(apt-mark hold, 예: kube 기반 rngd 이미지)도 설치된 것으로 본다.
+#   (예전엔 'install ok installed' 만 인정 → 고정된 curl 을 다시 설치하려다 libcurl4 고정과 충돌해 install 실패)
+apt_missing() { local p; for p in "$@"; do [[ "$(dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null)" == installed ]] || echo "$p"; done; }
 
 # ensure_dir <dir> : 디렉터리를 만들고 현재 사용자에게 쓰기 권한 (예: /models 는 루트 소유라 sudo 필요)
 ensure_dir() {

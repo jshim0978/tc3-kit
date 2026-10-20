@@ -338,6 +338,17 @@ sc_proxy_scoped() {
   chk "no proxy options without TC3_PROXY" hasnt <(echo "$a2") "Acquire::"
 }
 
+sc_apt_held() {
+  fresh apt_held mock
+  # kube 기반 rngd 이미지처럼 패키지가 apt-mark hold 된 VM: 설치된 것으로 봐야 install 이 다시 설치하려다 충돌하지 않음
+  apt-mark hold curl >/dev/null 2>&1 || { skip "apt-mark 불가 (root 아님)"; return; }
+  local out; out="$(bash -c 'TC3_HOME="$1"; source "$1/lib/common.sh"; apt_missing curl tc3-no-such-package' _ "$KIT")"
+  apt-mark unhold curl >/dev/null 2>&1
+  echo "apt_missing → [$out]" >> "$SC_LOG"
+  chk "held package counts as installed" hasnt <(echo "$out") "curl"
+  chk "really missing package still reported" has <(echo "$out") "tc3-no-such-package"
+}
+
 sc_env_bom() {
   fresh env_bom mock
   unset TC3_BACKEND TC3_PORT TC3_API_URL
@@ -722,7 +733,7 @@ ALL=(mock_all mock_steps furiosa_full serve_dies_fast serve_timeout serve_twice 
      soak_100 lspci_novendor lspci_none vllm_full ctrl_c_serve path_with_spaces nonroot timezone
      proxy_env env_bom soak_live_output backend_switch preflight_ok preflight_bad stop_stubborn old_sdk
      port_mismatch leader_dies ver_compare report_stale_soak platform_os_fail hf_login_flow fetch_model_net proxy_scoped
-     run_mock run_furiosa run_serve_fail run_preflight_gate run_monitor_fail live_fallback live_tmux start_all)
+     run_mock run_furiosa run_serve_fail run_preflight_gate run_monitor_fail live_fallback live_tmux start_all apt_held)
 
 i=0
 for name in "${ALL[@]}"; do
