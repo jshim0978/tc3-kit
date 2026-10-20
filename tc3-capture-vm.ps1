@@ -69,6 +69,18 @@ public static class TC3VmWin {
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
+  // 제목에 part 가 들어 있는 최상위 창 (Windows Terminal 은 제목 뒤에 다른 글자가 붙거나 늦게 바뀔 수 있음)
+  public static System.Collections.Generic.List<IntPtr> FindByTitlePart(string part) {
+    var res = new System.Collections.Generic.List<IntPtr>();
+    EnumWindows(delegate (IntPtr h, IntPtr l) {
+      var sb = new System.Text.StringBuilder(512); GetWindowText(h, sb, 512);
+      if (sb.ToString().Contains(part)) res.Add(h);
+      return true; }, IntPtr.Zero);
+    return res;
+  }
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
 "@
@@ -80,9 +92,11 @@ $TermClasses = @("CASCADIA_HOSTING_WINDOW_CLASS", "ConsoleWindowClass")
 $WinTitle = "TC3 capture $Stamp"
 try { $Host.UI.RawUI.WindowTitle = $WinTitle } catch { }
 $script:TermHwnd = [IntPtr]::Zero
-for ($i = 0; $i -lt 40 -and $script:TermHwnd -eq [IntPtr]::Zero; $i++) {
-  $h = [TC3VmWin]::FindWindow($null, $WinTitle)
-  if ($h -ne [IntPtr]::Zero -and (Get-WinClass $h) -in $TermClasses) { $script:TermHwnd = $h } else { Start-Sleep -Milliseconds 250 }
+# 최대 30초: 제목을 다시 걸면서(셸·터미널이 덮어쓸 수 있음) 그 제목을 포함하는 터미널 창을 찾는다
+for ($i = 0; $i -lt 120 -and $script:TermHwnd -eq [IntPtr]::Zero; $i++) {
+  if ($i % 8 -eq 0) { try { $Host.UI.RawUI.WindowTitle = $WinTitle } catch { } }
+  $cand = @([TC3VmWin]::FindByTitlePart($WinTitle) | Where-Object { (Get-WinClass $_) -in $TermClasses })
+  if ($cand.Count -ge 1) { $script:TermHwnd = $cand[0] } else { Start-Sleep -Milliseconds 250 }
 }
 if ($script:TermHwnd -eq [IntPtr]::Zero) {
   $h = [TC3VmWin]::GetForegroundWindow()
@@ -388,7 +402,7 @@ if ($Mode.Count -gt 0) {
   if ("prep" -in $Mode) {
     $null = Cap "env_vm" "0 시험 환경" @("hostname; grep PRETTY_NAME /etc/os-release; uname -r", "nproc; free -h | head -2; df -h ~ | tail -1")
     $null = Cap "env_npu" "0 시험 환경" @("lspci -nn | grep -iE 'furiosa|1ed2'", "furiosa-smi info", "furiosa-smi status")
-    $null = Cap "env_sdk" "0 시험 환경" @("dpkg -l | grep -E '^ii +furiosa-(driver-rngd|smi) '",
+    $null = Cap "env_sdk" "0 시험 환경" @("dpkg-query -W -f='`${Package} `${Version}  (`${db:Status-Status})\n' furiosa-driver-rngd furiosa-smi",
                                           '~/furiosa-venv/bin/python -c "from importlib.metadata import version as v; print(''furiosa-llm'', v(''furiosa-llm''))"',
                                           "python3 --version")
     $null = Cap "env_models" "0 시험 환경" @("grep -E '^TC3_(MODEL_DIR|ARTIFACT_DIR|HF_ARTIFACT_REVISION)=' tc3.env",

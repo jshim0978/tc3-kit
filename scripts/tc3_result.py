@@ -72,7 +72,8 @@ if a.files:
             continue
         if name == "step10_soak.log":   # 100줄 진행 기록 대신 요약 블록 + 한/영 질의응답 표본
             lines = t.splitlines()
-            keep = [ln for ln in lines if ln.startswith("#") or any(k in ln for k in ("requests", "success", "latency", "by language", "error", "FAIL", "ERR"))]
+            keys = ("requests", "success", "latency", "by language", "elapsed", "finished", "per-request", "answers (full)")
+            keep = [ln for ln in lines if ln.startswith("#") or ln.startswith(keys) or " ERR " in ln]
             t = "\n".join(keep[-40:]) + "\n"
             samples = []
             for ln in (read("soak_answers.jsonl") or "").splitlines()[:12]:
